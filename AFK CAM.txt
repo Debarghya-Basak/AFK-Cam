@@ -994,10 +994,18 @@ initialise_joystick_values()
 -- CAMERA STATE
 -- ============================================================
 
-local cockpit_base_camera =
-    ffi.new("XPLMCameraPosition_t")
-
+-- Retain this flag name to minimize changes elsewhere in the
+-- project. In cockpit mode it now means "AFK cockpit director
+-- active", not "AFK Director owns the camera".
 local cockpit_camera_controlled = false
+
+local cockpit_base_head_x = 0.0
+local cockpit_base_head_y = 0.0
+local cockpit_base_head_z = 0.0
+
+local cockpit_base_head_psi = 0.0
+local cockpit_base_head_the = 0.0
+local cockpit_base_head_phi = 0.0
 
 -- Aircraft pose captured at AFK entry.
 local cockpit_base_plane_x = 0.0
@@ -1014,7 +1022,6 @@ local cockpit_camera_offset_x = 0.0
 local cockpit_camera_offset_y = 0.0
 local cockpit_camera_offset_z = 0.0
 
-local cockpit_camera_callback
 
 local cockpit_last_callback_time = os.clock()
 
@@ -1041,6 +1048,45 @@ dataref(
 dataref(
     "afk_view_type",
     "sim/graphics/view/view_type"
+)
+
+-- ============================================================
+-- NORMAL X-PLANE COCKPIT CAMERA / PILOT HEAD
+-- ============================================================
+--
+-- Cockpit AFK does NOT take camera ownership. X-Plane's normal
+-- cockpit camera remains in charge while we animate only the
+-- virtual pilot's head. This lets other camera systems continue
+-- to operate normally.
+
+dataref(
+    "afk_pilot_head_x",
+    "sim/graphics/view/pilots_head_x"
+)
+
+dataref(
+    "afk_pilot_head_y",
+    "sim/graphics/view/pilots_head_y"
+)
+
+dataref(
+    "afk_pilot_head_z",
+    "sim/graphics/view/pilots_head_z"
+)
+
+dataref(
+    "afk_pilot_head_psi",
+    "sim/graphics/view/pilots_head_psi"
+)
+
+dataref(
+    "afk_pilot_head_the",
+    "sim/graphics/view/pilots_head_the"
+)
+
+dataref(
+    "afk_pilot_head_phi",
+    "sim/graphics/view/pilots_head_phi"
 )
 
 dataref(
@@ -1396,68 +1442,34 @@ end
 -- COCKPIT CAMERA CALLBACK
 -- ============================================================
 
-    cockpit_camera_callback = ffi.cast(
-        "XPLMCameraControl_f",
-        function(
-            out_camera,
-            losing_control,
-            refcon
-        )
+function cockpit_director_update(delta_time)
 
-            if losing_control ~= 0 then
-                cockpit_camera_controlled = false
-                return 0
-            end
+    if not afk_active then
+        return
+    end
+
+    if director_mode ~= "COCKPIT" then
+        return
+    end
 
 
-            if out_camera == nil then
-                return 0
-            end
+    -- Normal FlyWithLua frame time. No camera callback is involved.
+    if delta_time < 0 then
+        delta_time = 0
+    end
+
+    if delta_time > 0.1 then
+        delta_time = 0.1
+    end
+
+    cockpit_shot_time =
+        cockpit_shot_time
+        + delta_time
 
 
-            if not afk_active then
-                return 0
-            end
-
-
-            if director_mode ~= "COCKPIT" then
-                return 0
-            end
-
-
-            -- ----------------------------------------------------
-            -- Time
-            -- ----------------------------------------------------
-
-            local current_time =
-                os.clock()
-
-            local delta_time =
-                current_time
-                - cockpit_last_callback_time
-
-            cockpit_last_callback_time =
-                current_time
-
-
-            if delta_time < 0 then
-                delta_time = 0
-            end
-
-
-            if delta_time > 0.1 then
-                delta_time = 0.1
-            end
-
-
-            cockpit_shot_time =
-                cockpit_shot_time
-                + delta_time
-
-
-            -- ----------------------------------------------------
-            -- Change shot
-            -- ----------------------------------------------------
+    -- ----------------------------------------------------
+    -- Change shot
+    -- ----------------------------------------------------
 
             function cockpit_random_range(min_value, max_value)
 
@@ -1509,10 +1521,10 @@ end
         cockpit_set_shot(
             "LOOK LEFT",
 
-            cockpit_base_camera.heading
+            cockpit_base_head_psi
             - angle,
 
-            cockpit_base_camera.pitch,
+            cockpit_base_head_the,
 
             cockpit_random_move()
         )
@@ -1528,10 +1540,10 @@ end
         cockpit_set_shot(
             "LOOK RIGHT",
 
-            cockpit_base_camera.heading
+            cockpit_base_head_psi
             + angle,
 
-            cockpit_base_camera.pitch,
+            cockpit_base_head_the,
 
             cockpit_random_move()
         )
@@ -1547,9 +1559,9 @@ end
         cockpit_set_shot(
             "LOOK DOWN",
 
-            cockpit_base_camera.heading,
+            cockpit_base_head_psi,
 
-            cockpit_base_camera.pitch
+            cockpit_base_head_the
             - angle,
 
             cockpit_random_move()
@@ -1569,10 +1581,10 @@ end
         cockpit_set_shot(
             "LOOK PANEL LEFT",
 
-            cockpit_base_camera.heading
+            cockpit_base_head_psi
             - heading_angle,
 
-            cockpit_base_camera.pitch
+            cockpit_base_head_the
             - pitch_angle,
 
             cockpit_random_move()
@@ -1592,10 +1604,10 @@ end
         cockpit_set_shot(
             "LOOK PANEL RIGHT",
 
-            cockpit_base_camera.heading
+            cockpit_base_head_psi
             + heading_angle,
 
-            cockpit_base_camera.pitch
+            cockpit_base_head_the
             - pitch_angle,
 
             cockpit_random_move()
@@ -1619,8 +1631,8 @@ end
 
         cockpit_set_shot(
             "CENTER HOLD",
-            cockpit_base_camera.heading,
-            cockpit_base_camera.pitch,
+            cockpit_base_head_psi,
+            cockpit_base_head_the,
             cockpit_random_center_hold()
         )
 
@@ -1654,8 +1666,8 @@ end
 
             cockpit_set_shot(
                 "RETURN CENTER LEFT",
-                cockpit_base_camera.heading,
-                cockpit_base_camera.pitch,
+                cockpit_base_head_psi,
+                cockpit_base_head_the,
                 COCKPIT_MOVE_TIME
             )
 
@@ -1678,8 +1690,8 @@ end
 
             cockpit_set_shot(
                 "RETURN CENTER RIGHT",
-                cockpit_base_camera.heading,
-                cockpit_base_camera.pitch,
+                cockpit_base_head_psi,
+                cockpit_base_head_the,
                 COCKPIT_MOVE_TIME
             )
 
@@ -1702,8 +1714,8 @@ end
 
             cockpit_set_shot(
                 "RETURN CENTER DOWN",
-                cockpit_base_camera.heading,
-                cockpit_base_camera.pitch,
+                cockpit_base_head_psi,
+                cockpit_base_head_the,
                 COCKPIT_MOVE_TIME
             )
 
@@ -1726,8 +1738,8 @@ end
 
             cockpit_set_shot(
                 "RETURN CENTER PANEL LEFT",
-                cockpit_base_camera.heading,
-                cockpit_base_camera.pitch,
+                cockpit_base_head_psi,
+                cockpit_base_head_the,
                 COCKPIT_MOVE_TIME
             )
 
@@ -1750,8 +1762,8 @@ end
 
             cockpit_set_shot(
                 "RETURN CENTER PANEL RIGHT",
-                cockpit_base_camera.heading,
-                cockpit_base_camera.pitch,
+                cockpit_base_head_psi,
+                cockpit_base_head_the,
                 COCKPIT_MOVE_TIME
             )
 
@@ -1819,84 +1831,52 @@ end
 
 
         -- ----------------------------------------------------
-        -- Camera position
+        -- X-PLANE NORMAL COCKPIT CAMERA OUTPUT
         -- ----------------------------------------------------
         --
-        -- Keep the camera attached to the same physical point
-        -- inside the aircraft. The offset is rotated with the
-        -- aircraft's CURRENT pitch/roll/heading.
+        -- Write only the pilot-head values. X-Plane itself remains
+        -- responsible for placing the cockpit camera with the
+        -- aircraft. No world-space camera position/orientation is
+        -- calculated here.
 
-        local camera_world_offset_x,
-              camera_world_offset_y,
-              camera_world_offset_z =
-            cockpit_aircraft_to_world(
-                cockpit_camera_offset_x,
-                cockpit_camera_offset_y,
-                cockpit_camera_offset_z,
-                afk_plane_pitch,
-                afk_plane_roll,
-                afk_plane_heading
-            )
+        -- Explicitly push the animated head values into X-Plane.
+        -- Using set() here makes the write unambiguous while the
+        -- normal cockpit camera remains under X-Plane/XPRealistic.
 
+        set(
+            "sim/graphics/view/pilots_head_x",
+            cockpit_base_head_x
+        )
 
-        out_camera.x =
-            afk_plane_local_x
-            + camera_world_offset_x
+        set(
+            "sim/graphics/view/pilots_head_y",
+            cockpit_base_head_y
+        )
 
-        out_camera.y =
-            afk_plane_local_y
-            + camera_world_offset_y
+        set(
+            "sim/graphics/view/pilots_head_z",
+            cockpit_base_head_z
+        )
 
-        out_camera.z =
-            afk_plane_local_z
-            + camera_world_offset_z
+        set(
+            "sim/graphics/view/pilots_head_psi",
+            heading
+        )
 
-
-        -- ----------------------------------------------------
-        -- Camera orientation
-        -- ----------------------------------------------------
-        --
-        -- Apply the aircraft's attitude change since AFK began
-        -- to the scripted head movement. This keeps the head
-        -- attached to the airplane during pitch/roll/turns.
-
-        local aircraft_heading_delta =
-            cockpit_wrap_heading(
-                afk_plane_heading
-                - cockpit_base_plane_heading
-            )
-
-        local aircraft_pitch_delta =
-            afk_plane_pitch
-            - cockpit_base_plane_pitch
-
-        local aircraft_roll_delta =
-            afk_plane_roll
-            - cockpit_base_plane_roll
-
-
-        out_camera.heading =
-            cockpit_wrap_heading(
-                heading
-                + aircraft_heading_delta
-            )
-
-        out_camera.pitch =
+        set(
+            "sim/graphics/view/pilots_head_the",
             pitch
-            + aircraft_pitch_delta
+        )
 
-        out_camera.roll =
-            cockpit_base_camera.roll
-            + aircraft_roll_delta
+        -- Preserve the pilot's existing head roll. Aircraft bank
+        -- remains under X-Plane's normal cockpit camera.
+        set(
+            "sim/graphics/view/pilots_head_phi",
+            cockpit_base_head_phi
+        )
 
-        out_camera.zoom =
-            cockpit_base_camera.zoom
+end
 
-
-        return 1
-
-    end
-)
 
 -- ============================================================
 -- START COCKPIT CAMERA
@@ -1908,79 +1888,42 @@ function start_cockpit_camera()
         return
     end
 
+    -- Capture the exact normal X-Plane pilot-head pose.
+    cockpit_base_head_x =
+        tonumber(afk_pilot_head_x) or 0.0
 
-    -- Capture EXACT current camera position
-    XPLM.XPLMReadCameraPosition(
-        cockpit_base_camera
-    )
+    cockpit_base_head_y =
+        tonumber(afk_pilot_head_y) or 0.0
 
-    -- Capture the aircraft pose at the exact moment AFK begins.
-    cockpit_base_plane_x =
-        afk_plane_local_x
+    cockpit_base_head_z =
+        tonumber(afk_pilot_head_z) or 0.0
 
-    cockpit_base_plane_y =
-        afk_plane_local_y
+    cockpit_base_head_psi =
+        tonumber(afk_pilot_head_psi) or 0.0
 
-    cockpit_base_plane_z =
-        afk_plane_local_z
+    cockpit_base_head_the =
+        tonumber(afk_pilot_head_the) or 0.0
 
-    cockpit_base_plane_pitch =
-        afk_plane_pitch
+    cockpit_base_head_phi =
+        tonumber(afk_pilot_head_phi) or 0.0
 
-    cockpit_base_plane_roll =
-        afk_plane_roll
-
-    cockpit_base_plane_heading =
-        afk_plane_heading
-
-
-    -- Convert the captured camera position into aircraft-relative
-    -- coordinates. This makes the cockpit point follow aircraft
-    -- translation AND rotation.
-    local initial_offset_x =
-        cockpit_base_camera.x
-        - cockpit_base_plane_x
-
-    local initial_offset_y =
-        cockpit_base_camera.y
-        - cockpit_base_plane_y
-
-    local initial_offset_z =
-        cockpit_base_camera.z
-        - cockpit_base_plane_z
-
-
-    cockpit_camera_offset_x,
-    cockpit_camera_offset_y,
-    cockpit_camera_offset_z =
-        cockpit_world_to_aircraft(
-            initial_offset_x,
-            initial_offset_y,
-            initial_offset_z,
-            cockpit_base_plane_pitch,
-            cockpit_base_plane_roll,
-            cockpit_base_plane_heading
-        )
 
     cockpit_camera_controlled = true
 
-    cockpit_last_callback_time =
-        os.clock()
 
-
-    -- Start the animation from the player's
-    -- exact current camera orientation.
+    -- Start the scripted animation from the exact current
+    -- pilot-head orientation.
     cockpit_start_heading =
-        cockpit_base_camera.heading
+        cockpit_base_head_psi
 
     cockpit_start_pitch =
-        cockpit_base_camera.pitch
+        cockpit_base_head_the
 
     cockpit_target_heading =
-        cockpit_base_camera.heading
+        cockpit_base_head_psi
 
     cockpit_target_pitch =
-        cockpit_base_camera.pitch
+        cockpit_base_head_the
 
 
     cockpit_shot =
@@ -1995,18 +1938,13 @@ function start_cockpit_camera()
         COCKPIT_CENTER_HOLD
 
 
-    -- Take camera control AFTER the current
-    -- position has been captured.
-    XPLM.XPLMControlCamera(
-        AFK_CAMERA_CONTROL_DURATION,
-        cockpit_camera_callback,
-        nil
-    )
-
-
+    -- IMPORTANT:
+    -- Do not call XPLMControlCamera() here.
+    -- X-Plane's normal cockpit camera remains active.
     logMsg(
         "AFK DIRECTOR: "
-        .. "COCKPIT DIRECTOR STARTED"
+        .. "COCKPIT DIRECTOR STARTED - "
+        .. "NORMAL X-PLANE CAMERA / XPREALISTIC COMPATIBLE"
     )
 
 end
@@ -2022,19 +1960,35 @@ function stop_cockpit_camera()
         return
     end
 
+    -- Restore the exact pilot-head pose from before AFK.
+    afk_pilot_head_x =
+        cockpit_base_head_x
+
+    afk_pilot_head_y =
+        cockpit_base_head_y
+
+    afk_pilot_head_z =
+        cockpit_base_head_z
+
+    afk_pilot_head_psi =
+        cockpit_base_head_psi
+
+    afk_pilot_head_the =
+        cockpit_base_head_the
+
+    afk_pilot_head_phi =
+        cockpit_base_head_phi
+
 
     cockpit_camera_controlled = false
 
 
-    -- Give camera ownership back to X-Plane.
-    -- XPRealistic can then resume its camera effects.
-    XPLM.XPLMDontControlCamera()
-
-
+    -- No XPLMDontControlCamera() call here because cockpit AFK
+    -- never took control of the X-Plane camera.
     logMsg(
         "AFK DIRECTOR: "
-        .. "COCKPIT CAMERA CONTROL RELEASED - "
-        .. "HANDING CAMERA BACK TO XPREALISTIC/X-PLANE"
+        .. "COCKPIT DIRECTOR STOPPED - "
+        .. "X-PLANE / XPREALISTIC CAMERA UNTOUCHED"
     )
 
 end
@@ -2692,6 +2646,23 @@ function afk_director_update()
 
 
     -- --------------------------------------------------------
+    -- COCKPIT DIRECTOR
+    -- --------------------------------------------------------
+    --
+    -- This updates pilot-head DataRefs while X-Plane keeps control
+    -- of the actual cockpit camera.
+
+    if afk_active
+    and director_mode == "COCKPIT" then
+
+        cockpit_director_update(
+            delta_time
+        )
+
+    end
+
+
+    -- --------------------------------------------------------
     -- AFK TIMER
     -- --------------------------------------------------------
 
@@ -3012,6 +2983,10 @@ logMsg(
 
 logMsg(
     "Normal flight camera owner: XPRealistic / X-Plane"
+)
+
+logMsg(
+    "Cockpit AFK method: X-Plane pilot-head DataRef writes"
 )
 
 logMsg(
