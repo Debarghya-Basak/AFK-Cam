@@ -1,0 +1,3027 @@
+-- ============================================================
+-- AFK DIRECTOR
+-- Phase 5 - FFI Cockpit Camera Control
+-- ============================================================
+
+
+-- ============================================================
+-- SETTINGS
+-- ============================================================
+
+local AFK_TIMEOUT = 3.0
+
+-- Camera ownership policy:
+-- NORMAL FLIGHT: AFK Director NEVER controls the camera.
+--                 XPRealistic / X-Plane remains in charge.
+-- AFK MODE:      AFK Director takes camera control.
+-- EXIT AFK:      AFK Director explicitly releases control.
+--
+-- X-Plane SDK camera-control duration:
+--   1 = until view changes
+--   2 = forever / until another plugin forcibly takes control
+local AFK_CAMERA_CONTROL_DURATION = 2
+
+-- AFK exterior cinematic camera settings.
+--
+-- Angles are relative to the aircraft heading:
+--   0    = rear
+--   +90  = left side
+--   180  = nose
+--   -90  = right side
+--
+-- Each shot slowly moves toward its target position, holds,
+-- then cuts instantly to the next shot.
+local AFK_EXTERNAL_ZOOM = 1.0
+-- Height of the aircraft-attached visual center that the
+-- exterior camera continuously tracks.
+local AFK_EXTERNAL_TARGET_HEIGHT = 1.5
+
+local AFK_EXTERNAL_SHOT_SPEED = 3.5
+-- Base camera speed. Short shots are automatically slowed so every shot lasts >10 seconds.
+local AFK_EXTERNAL_MIN_SHOT_DURATION = 11.0
+
+local AFK_EXTERNAL_SHOTS = {
+    {
+        name = "RIGHT REAR CLOSE",
+        start_x = 17.00, start_y = 6.80, start_z = 20.40,
+        end_x = 11.05, end_y = 5.61, end_z = 15.04
+    },
+    {
+        name = "LEFT NOSE CLOSE",
+        start_x = -17.85, start_y = 6.80, start_z = -3.40,
+        end_x = -11.90, end_y = 5.02, end_z = -7.56
+    },
+    {
+        name = "TOP NOSE DIAGONAL",
+        start_x = -8.50, start_y = 15.30, start_z = -12.75,
+        end_x = 2.21, end_y = 10.54, end_z = -16.32
+    },
+    {
+        name = "LOW SIDE SWEEP",
+        start_x = 17.00, start_y = 3.40, start_z = 5.95,
+        end_x = -6.20, end_y = 4.00, end_z = 1.79
+    },
+    {
+        name = "LEFT WING CLOSE",
+        start_x = -23.80, start_y = 7.65, start_z = 1.70,
+        end_x = -14.28, end_y = 7.05, end_z = 5.86
+    },
+    {
+        name = "TAIL DIAGONAL",
+        start_x = -9.35, start_y = 6.80, start_z = 24.65,
+        end_x = 3.15, end_y = 5.61, end_z = 17.51
+    },
+    {
+        name = "NOSE LOW TO HIGH",
+        start_x = 0.00, start_y = 3.40, start_z = -22.95,
+        end_x = 0.00, end_y = 10.54, end_z = -18.19
+    },
+    {
+        name = "HIGH RIGHT PASS",
+        start_x = 22.95, start_y = 16.15, start_z = 3.40,
+        end_x = 15.81, end_y = 11.98, end_z = -4.33
+    },
+    {
+        name = "RIGHT FRONT CLOSE",
+        start_x = 19.55, start_y = 5.95, start_z = -8.50,
+        end_x = 13.00, end_y = 6.54, end_z = -13.85
+    },
+    {
+        name = "LOW LEFT DIAGONAL",
+        start_x = -19.55, start_y = 2.55, start_z = 3.40,
+        end_x = -11.22, end_y = 4.93, end_z = -3.14
+    },
+    {
+        name = "OVERHEAD CLOSE",
+        start_x = 7.65, start_y = 21.25, start_z = 10.20,
+        end_x = -1.87, end_y = 15.30, end_z = -4.67
+    },
+    {
+        name = "LEFT REAR CLOSE",
+        start_x = -16.15, start_y = 6.80, start_z = 21.25,
+        end_x = -10.20, end_y = 5.02, end_z = 14.71
+    }
+}
+
+-- ------------------------------------------------------------
+-- RANDOM NO-REPEAT EXTERNAL SHOT BAG
+-- ------------------------------------------------------------
+--
+-- Each cycle contains every one of the 12 shots exactly once,
+-- in a randomized order. When the bag is exhausted it is
+-- reshuffled. The first shot of the new cycle is also forced
+-- to differ from the final shot of the previous cycle.
+
+local external_shot_bag = {}
+local external_shot_bag_position = 0
+local external_last_shot_index = nil
+
+math.randomseed(os.time())
+
+function shuffle_external_shot_bag()
+
+    external_shot_bag = {}
+
+    for i = 1, #AFK_EXTERNAL_SHOTS do
+        external_shot_bag[i] = i
+    end
+
+    -- Fisher-Yates shuffle.
+    for i = #external_shot_bag, 2, -1 do
+        local j = math.random(i)
+
+        external_shot_bag[i],
+        external_shot_bag[j] =
+            external_shot_bag[j],
+            external_shot_bag[i]
+    end
+
+    -- Prevent an immediate repeat across cycle boundaries.
+    if #external_shot_bag > 1
+       and external_last_shot_index ~= nil
+       and external_shot_bag[1] == external_last_shot_index then
+
+        local swap_index =
+            math.random(2, #external_shot_bag)
+
+        external_shot_bag[1],
+        external_shot_bag[swap_index] =
+            external_shot_bag[swap_index],
+            external_shot_bag[1]
+    end
+
+    external_shot_bag_position = 0
+end
+
+function get_next_external_shot_index()
+
+    if external_shot_bag_position >= #external_shot_bag
+       or #external_shot_bag == 0 then
+
+        shuffle_external_shot_bag()
+    end
+
+    external_shot_bag_position =
+        external_shot_bag_position + 1
+
+    local shot_index =
+        external_shot_bag[external_shot_bag_position]
+
+    external_last_shot_index =
+        shot_index
+
+    return shot_index
+end
+
+local CAMERA_MOVEMENT_THRESHOLD = 0.01
+
+
+-- ============================================================
+-- STATE
+-- ============================================================
+
+local idle_time = 0.0
+
+local afk_active = false
+
+local last_heading = nil
+local last_pitch = nil
+local last_roll = nil
+
+local last_update_time = os.clock()
+
+local camera_status = "INITIALIZING"
+
+local afk_status = "ACTIVE"
+
+local last_activity = "None"
+
+local director_mode = "NONE"
+
+local current_shot = "NONE"
+
+local mouse_input_detected = false
+
+
+-- ============================================================
+-- COCKPIT CAMERA SETTINGS
+-- ============================================================
+
+local cockpit_animation_time = 0.0
+
+-- Lower = slower
+local cockpit_animation_speed = 0.35
+
+-- Maximum left/right movement
+local cockpit_heading_amplitude = 25.0
+
+-- Maximum up/down movement
+local cockpit_pitch_amplitude = 5.0
+
+
+-- ============================================================
+-- X-PLANE CAMERA FFI
+-- ============================================================
+
+local ffi = require("ffi")
+
+ffi.cdef[[
+typedef struct {
+    float x;
+    float y;
+    float z;
+    float pitch;
+    float heading;
+    float roll;
+    float zoom;
+} XPLMCameraPosition_t;
+
+typedef int (*XPLMCameraControl_f)(
+    XPLMCameraPosition_t *outCameraPosition,
+    int inIsLosingControl,
+    void *inRefcon
+);
+
+void XPLMControlCamera(
+    int inHowLong,
+    XPLMCameraControl_f inControlFunc,
+    void *inRefcon
+);
+
+void XPLMDontControlCamera(void);
+
+void XPLMReadCameraPosition(
+    XPLMCameraPosition_t *outCameraPosition
+);
+]]
+
+local XPLM = ffi.load("XPLM_64")
+
+-- ============================================================
+-- X-PLANE VIEW COMMANDS
+-- ============================================================
+
+ffi.cdef[[
+typedef void *XPLMCommandRef;
+
+XPLMCommandRef XPLMFindCommand(
+    const char *inName
+);
+
+void XPLMCommandOnce(
+    XPLMCommandRef inCommand
+);
+]]
+
+local external_circle_command =
+    XPLM.XPLMFindCommand(
+        "sim/view/circle"
+    )
+
+if external_circle_command == nil then
+    logMsg(
+        "AFK DIRECTOR: FAILED TO FIND sim/view/circle"
+    )
+else
+    logMsg(
+        "AFK DIRECTOR: EXTERNAL CIRCLE COMMAND FOUND"
+    )
+end
+
+
+-- ============================================================
+-- EXTERNAL CIRCLE CAMERA STATE
+-- ============================================================
+
+local external_camera_controlled =
+    false
+
+local external_camera_callback
+
+local external_last_callback_time =
+    os.clock()
+
+local external_shot_index =
+    1
+
+local external_shot_phase =
+    "MOVE"
+
+local external_shot_time =
+    0.0
+
+local external_current_x = 20.0
+local external_current_y = 8.0
+local external_current_z = 24.0
+
+local external_start_x = 20.0
+local external_start_y = 8.0
+local external_start_z = 24.0
+
+local external_target_x = 10.0
+local external_target_y = 6.0
+local external_target_z = 15.0
+
+local external_shot_distance = 0.0
+local external_shot_duration = 1.0
+
+
+-- ============================================================
+-- KEYBOARD INPUT DETECTION
+-- ============================================================
+
+ffi.cdef[[
+typedef int XPLMKeyFlags;
+
+typedef int (*XPLMKeySniffer_f)(
+    char inChar,
+    XPLMKeyFlags inFlags,
+    char inVirtualKey,
+    void *inRefcon
+);
+
+int XPLMRegisterKeySniffer(
+    XPLMKeySniffer_f inCallback,
+    int inBeforeWindows,
+    void *inRefcon
+);
+
+int XPLMUnregisterKeySniffer(
+    XPLMKeySniffer_f inCallback,
+    int inBeforeWindows,
+    void *inRefcon
+);
+]]
+
+local keyboard_input_detected = false
+local keyboard_callback
+
+keyboard_callback = ffi.cast(
+    "XPLMKeySniffer_f",
+    function(inChar, inFlags, inVirtualKey, inRefcon)
+
+        keyboard_input_detected = true
+
+        return 1
+    end
+)
+
+local keyboard_sniffer_result =
+    XPLM.XPLMRegisterKeySniffer(
+        keyboard_callback,
+        0,
+        nil
+    )
+
+if keyboard_sniffer_result == 1 then
+    logMsg("AFK DIRECTOR: KEYBOARD SNIFFER REGISTERED")
+else
+    logMsg("AFK DIRECTOR: KEYBOARD SNIFFER REGISTRATION FAILED")
+end
+
+-- ============================================================
+-- WINDOWS MOUSE BUTTON DETECTION
+-- ============================================================
+--
+-- FlyWithLua's normal mouse callback does not catch the
+-- right-button camera drag in this setup.
+--
+-- Poll the actual Windows mouse button state instead.
+-- Both left and right buttons are treated as activity while
+-- held, so a continuous camera drag keeps the AFK timer at 0.
+--
+-- The buttons are only observed; nothing is consumed or changed.
+
+local user32 =
+    ffi.load("user32")
+
+ffi.cdef[[
+short GetAsyncKeyState(int vKey);
+]]
+
+local VK_LBUTTON =
+    0x01
+
+local VK_RBUTTON =
+    0x02
+
+local right_mouse_was_down =
+    false
+
+local right_mouse_input_detected =
+    false
+
+
+function poll_mouse_buttons()
+
+    local left_mouse_down =
+        bit.band(
+            tonumber(
+                user32.GetAsyncKeyState(
+                    VK_LBUTTON
+                )
+            ),
+            0x8000
+        ) ~= 0
+
+
+    local right_mouse_down =
+        bit.band(
+            tonumber(
+                user32.GetAsyncKeyState(
+                    VK_RBUTTON
+                )
+            ),
+            0x8000
+        ) ~= 0
+
+
+    -- LEFT BUTTON:
+    -- Keep the normal FlyWithLua mouse handler alive for
+    -- clicks, and also treat a held button as continuous
+    -- activity during a camera drag.
+    if left_mouse_down then
+
+        mouse_input_detected =
+            true
+
+    end
+
+
+    -- RIGHT BUTTON:
+    -- FlyWithLua's normal callback does not see this button
+    -- in the user's camera drag setup, so handle it here.
+    if right_mouse_down then
+
+        right_mouse_input_detected =
+            true
+
+    end
+
+
+    right_mouse_was_down =
+        right_mouse_down
+
+end
+
+
+function handle_right_mouse_activity()
+
+    if not right_mouse_input_detected then
+        return false
+    end
+
+    right_mouse_input_detected =
+        false
+
+    idle_time =
+        0.0
+
+    last_activity =
+        "Right mouse drag"
+
+    if afk_active then
+
+        afk_active =
+            false
+
+        afk_status =
+            "ACTIVE"
+
+        current_shot =
+            "NONE"
+
+        stop_afk_camera()
+
+        logMsg(
+            "AFK DIRECTOR: "
+            .. "EXITED AFK MODE - "
+            .. "RIGHT MOUSE INPUT"
+        )
+
+    end
+
+    return true
+
+end
+
+
+
+-- ============================================================
+-- X-PLANE MOUSE JOYSTICK INPUT
+-- ============================================================
+--
+-- X-Plane has a separate "mouse acting as a joystick" mode.
+-- These are bound using FlyWithLua's normal dataref() syntax:
+-- dataref("Lua variable", "X-Plane DataRef", "readonly")
+--
+-- Do not assign the return value of dataref() to a local. The
+-- function binds the named Lua variable to the DataRef.
+--
+-- This mode provides mouse-yoke pitch/roll input when enabled.
+-- It is intentionally kept separate from the physical joystick
+-- layer below.
+
+dataref(
+    "afk_mouse_is_joystick",
+    "sim/joystick/mouse_is_joystick",
+    "readonly"
+)
+
+dataref(
+    "afk_mouse_yoke_pitch",
+    "sim/joystick/yoke_pitch_ratio",
+    "readonly"
+)
+
+dataref(
+    "afk_mouse_yoke_roll",
+    "sim/joystick/yoke_roll_ratio",
+    "readonly"
+)
+
+
+local MOUSE_YOKE_CHANGE_THRESHOLD =
+    0.01
+
+local mouse_yoke_previous_pitch =
+    nil
+
+local mouse_yoke_previous_roll =
+    nil
+
+local mouse_yoke_initialised =
+    false
+
+local mouse_yoke_input_detected =
+    false
+
+local mouse_yoke_input_type =
+    "Mouse Yoke"
+
+
+function initialise_mouse_yoke_values()
+
+    mouse_yoke_previous_pitch =
+        tonumber(
+            afk_mouse_yoke_pitch
+        )
+
+    mouse_yoke_previous_roll =
+        tonumber(
+            afk_mouse_yoke_roll
+        )
+
+    mouse_yoke_initialised =
+        true
+
+end
+
+
+function poll_mouse_yoke_input()
+
+    local active =
+        tonumber(
+            afk_mouse_is_joystick
+        ) == 1
+
+
+    local pitch =
+        tonumber(
+            afk_mouse_yoke_pitch
+        )
+
+    local roll =
+        tonumber(
+            afk_mouse_yoke_roll
+        )
+
+
+    if pitch == nil then
+        pitch = 0.0
+    end
+
+    if roll == nil then
+        roll = 0.0
+    end
+
+
+    if not mouse_yoke_initialised then
+
+        mouse_yoke_previous_pitch =
+            pitch
+
+        mouse_yoke_previous_roll =
+            roll
+
+        mouse_yoke_initialised =
+            true
+
+        return
+
+    end
+
+
+    if active then
+
+        local pitch_change =
+            math.abs(
+                pitch
+                - mouse_yoke_previous_pitch
+            )
+
+        local roll_change =
+            math.abs(
+                roll
+                - mouse_yoke_previous_roll
+            )
+
+
+        if pitch_change >
+            MOUSE_YOKE_CHANGE_THRESHOLD then
+
+            mouse_yoke_input_detected =
+                true
+
+            mouse_yoke_input_type =
+                "Mouse Yoke Pitch"
+
+        elseif roll_change >
+            MOUSE_YOKE_CHANGE_THRESHOLD then
+
+            mouse_yoke_input_detected =
+                true
+
+            mouse_yoke_input_type =
+                "Mouse Yoke Roll"
+
+        end
+
+    end
+
+
+    mouse_yoke_previous_pitch =
+        pitch
+
+    mouse_yoke_previous_roll =
+        roll
+
+end
+
+
+function handle_mouse_yoke_activity()
+
+    if not mouse_yoke_input_detected then
+        return false
+    end
+
+
+    mouse_yoke_input_detected =
+        false
+
+
+    idle_time =
+        0.0
+
+
+    last_activity =
+        mouse_yoke_input_type
+
+
+    if afk_active then
+
+        afk_active =
+            false
+
+        afk_status =
+            "ACTIVE"
+
+        current_shot =
+            "NONE"
+
+        stop_afk_camera()
+
+        logMsg(
+            "AFK DIRECTOR: "
+            .. "EXITED AFK MODE - "
+            .. mouse_yoke_input_type
+        )
+
+    end
+
+
+    return true
+
+end
+
+
+initialise_mouse_yoke_values()
+
+
+-- ============================================================
+-- JOYSTICK INPUT DETECTION
+-- ============================================================
+--
+-- Detect real joystick changes from X-Plane's raw joystick
+-- axis/button values.
+--
+-- IMPORTANT:
+-- Do not assume a default axis center when no joystick is
+-- connected. Instead, compare the raw axis value from one
+-- frame to the next. Aircraft attitude cannot change these
+-- raw joystick values.
+--
+-- Axis assignments:
+--   1 = Pitch
+--   2 = Roll
+--   3 = Yaw
+--
+-- Buttons are treated as activity while physically held.
+
+local joystick_axis_values =
+    dataref_table(
+        "sim/joystick/joystick_axis_values"
+    )
+
+local joystick_axis_assignments =
+    dataref_table(
+        "sim/joystick/joystick_axis_assignments"
+    )
+
+local joystick_button_values =
+    dataref_table(
+        "sim/joystick/joystick_button_values"
+    )
+
+
+local JOYSTICK_AXIS_COUNT =
+    500
+
+local JOYSTICK_BUTTON_COUNT =
+    3200
+
+local JOYSTICK_AXIS_CHANGE_THRESHOLD =
+    0.01
+
+
+local joystick_previous_axis_values = {}
+
+local joystick_input_detected =
+    false
+
+local joystick_input_type =
+    "NONE"
+
+
+local joystick_initialised =
+    false
+
+
+function initialise_joystick_values()
+
+    joystick_previous_axis_values =
+        {}
+
+    for i = 0, JOYSTICK_AXIS_COUNT - 1 do
+
+        local value =
+            tonumber(
+                joystick_axis_values[i]
+            )
+
+        if value ~= nil then
+
+            joystick_previous_axis_values[i] =
+                value
+
+        end
+
+    end
+
+    joystick_initialised =
+        true
+
+end
+
+
+function poll_joystick_input()
+
+    -- --------------------------------------------------------
+    -- First frame: establish a baseline.
+    -- --------------------------------------------------------
+    --
+    -- This is critical when no joystick is attached. X-Plane
+    -- may still expose default values/assignments; those values
+    -- are not treated as player input until they actually change.
+
+    if not joystick_initialised then
+
+        initialise_joystick_values()
+
+        return
+
+    end
+
+
+    -- --------------------------------------------------------
+    -- Pitch / Roll / Yaw axis movement
+    -- --------------------------------------------------------
+
+    for i = 0, JOYSTICK_AXIS_COUNT - 1 do
+
+        local assignment =
+            tonumber(
+                joystick_axis_assignments[i]
+            )
+
+        if assignment == 1
+        or assignment == 2
+        or assignment == 3 then
+
+            local current_value =
+                tonumber(
+                    joystick_axis_values[i]
+                )
+
+            local previous_value =
+                joystick_previous_axis_values[i]
+
+            if current_value ~= nil then
+
+                if previous_value == nil then
+
+                    joystick_previous_axis_values[i] =
+                        current_value
+
+                else
+
+                    local difference =
+                        math.abs(
+                            current_value
+                            - previous_value
+                        )
+
+
+                    if difference >
+                        JOYSTICK_AXIS_CHANGE_THRESHOLD then
+
+                        joystick_input_detected =
+                            true
+
+
+                        if assignment == 1 then
+
+                            joystick_input_type =
+                                "Joystick Pitch"
+
+                        elseif assignment == 2 then
+
+                            joystick_input_type =
+                                "Joystick Roll"
+
+                        else
+
+                            joystick_input_type =
+                                "Joystick Yaw"
+
+                        end
+
+
+                        joystick_previous_axis_values[i] =
+                            current_value
+
+                        return
+
+                    end
+
+
+                    joystick_previous_axis_values[i] =
+                        current_value
+
+                end
+
+            end
+
+        end
+
+    end
+
+
+    -- --------------------------------------------------------
+    -- Joystick buttons
+    -- --------------------------------------------------------
+    --
+    -- Physical joystick buttons are active while held.
+    -- No button is generated merely because an assignment exists.
+
+    for i = 0, JOYSTICK_BUTTON_COUNT - 1 do
+
+        local pressed =
+            tonumber(
+                joystick_button_values[i]
+            )
+
+        if pressed ~= nil
+        and pressed ~= 0 then
+
+            joystick_input_detected =
+                true
+
+            joystick_input_type =
+                "Joystick Button"
+
+            return
+
+        end
+
+    end
+
+end
+
+
+function handle_joystick_activity()
+
+    if not joystick_input_detected then
+        return false
+    end
+
+
+    joystick_input_detected =
+        false
+
+
+    idle_time =
+        0.0
+
+
+    last_activity =
+        joystick_input_type
+
+
+    if afk_active then
+
+        afk_active =
+            false
+
+        afk_status =
+            "ACTIVE"
+
+        current_shot =
+            "NONE"
+
+        stop_afk_camera()
+
+        logMsg(
+            "AFK DIRECTOR: "
+            .. "EXITED AFK MODE - "
+            .. joystick_input_type
+        )
+
+    end
+
+
+    return true
+
+end
+
+
+initialise_joystick_values()
+
+
+
+
+-- ============================================================
+-- CAMERA STATE
+-- ============================================================
+
+local cockpit_base_camera =
+    ffi.new("XPLMCameraPosition_t")
+
+local cockpit_camera_controlled = false
+
+-- Aircraft pose captured at AFK entry.
+local cockpit_base_plane_x = 0.0
+local cockpit_base_plane_y = 0.0
+local cockpit_base_plane_z = 0.0
+
+local cockpit_base_plane_pitch = 0.0
+local cockpit_base_plane_roll = 0.0
+local cockpit_base_plane_heading = 0.0
+
+-- Camera position relative to the aircraft at AFK entry,
+-- expressed in aircraft coordinates.
+local cockpit_camera_offset_x = 0.0
+local cockpit_camera_offset_y = 0.0
+local cockpit_camera_offset_z = 0.0
+
+local cockpit_camera_callback
+
+local cockpit_last_callback_time = os.clock()
+
+
+-- ============================================================
+-- CAMERA DATAREFS
+-- ============================================================
+
+dataref(
+    "afk_view_heading",
+    "sim/graphics/view/view_heading"
+)
+
+dataref(
+    "afk_view_pitch",
+    "sim/graphics/view/view_pitch"
+)
+
+dataref(
+    "afk_view_roll",
+    "sim/graphics/view/view_roll"
+)
+
+dataref(
+    "afk_view_type",
+    "sim/graphics/view/view_type"
+)
+
+dataref(
+    "afk_plane_local_x",
+    "sim/flightmodel/position/local_x"
+)
+
+dataref(
+    "afk_plane_local_y",
+    "sim/flightmodel/position/local_y"
+)
+
+dataref(
+    "afk_plane_local_z",
+    "sim/flightmodel/position/local_z"
+)
+
+dataref(
+    "afk_plane_pitch",
+    "sim/flightmodel/position/theta"
+)
+
+dataref(
+    "afk_plane_roll",
+    "sim/flightmodel/position/phi"
+)
+
+dataref(
+    "afk_plane_heading",
+    "sim/flightmodel/position/psi"
+)
+
+
+-- ============================================================
+-- PLAYER ACTIVITY
+-- ============================================================
+
+function player_activity(activity)
+
+    idle_time = 0.0
+
+    last_activity = activity
+
+
+    if afk_active then
+
+        afk_active = false
+
+        afk_status = "ACTIVE"
+
+        current_shot = "NONE"
+
+
+        -- Release camera control ONLY if AFK Director currently
+        -- owns the camera. This hands ownership back to X-Plane,
+        -- allowing XPRealistic to resume its camera effects.
+        stop_afk_camera()
+
+
+        logMsg(
+            "AFK DIRECTOR: EXIT - "
+            .. activity
+        )
+
+    end
+
+end
+
+
+-- ============================================================
+-- VIEW TYPE
+-- ============================================================
+
+function update_director_mode()
+
+    if afk_view_type == 1026 then
+
+        director_mode = "COCKPIT"
+
+    elseif afk_view_type == 1018
+        or afk_view_type == 1028
+        or afk_view_type == 1015
+        or afk_view_type == 1020 then
+
+        director_mode = "EXTERNAL"
+
+    else
+
+        director_mode = "UNKNOWN"
+
+    end
+
+end
+
+
+-- ============================================================
+-- COCKPIT CAMERA DIRECTOR - PHASE 6
+-- CENTER -> LEFT -> CENTER
+-- ============================================================
+
+local cockpit_shot = "CENTER"
+
+local cockpit_shot_time = 0.0
+
+local cockpit_shot_duration = 2.5
+
+local cockpit_start_heading = 0.0
+local cockpit_target_heading = 0.0
+
+local cockpit_start_pitch = 0.0
+local cockpit_target_pitch = 0.0
+
+
+-- How far the pilot looks to the left
+local COCKPIT_LEFT_ANGLE = 25.0
+
+-- How long each movement takes
+local COCKPIT_MOVE_TIME = 2.5
+
+-- How long to stay looking left
+local COCKPIT_HOLD_TIME = 1.5
+
+-- How long to stay centered
+local COCKPIT_CENTER_HOLD = 2.0
+
+local COCKPIT_RIGHT_ANGLE = 25.0
+
+local COCKPIT_DOWN_ANGLE = 12.0
+
+local COCKPIT_PANEL_LEFT = 15.0
+local COCKPIT_PANEL_DOWN = 8.0
+
+local COCKPIT_PANEL_RIGHT = 15.0
+
+local cockpit_last_random_choice = 0
+
+math.randomseed(os.time())
+
+
+-- ============================================================
+-- SMOOTHSTEP
+-- ============================================================
+
+function cockpit_smoothstep(t)
+
+    if t < 0 then
+        t = 0
+    end
+
+    if t > 1 then
+        t = 1
+    end
+
+    return t * t * (3.0 - 2.0 * t)
+
+end
+
+
+-- ============================================================
+-- START NEW COCKPIT SHOT
+-- ============================================================
+
+function cockpit_set_shot(
+    shot_name,
+    target_heading,
+    target_pitch,
+    duration
+)
+
+    cockpit_shot = shot_name
+    current_shot = shot_name
+
+    cockpit_shot_time = 0.0
+
+    cockpit_shot_duration =
+        duration
+
+    cockpit_start_heading =
+        cockpit_target_heading
+
+    cockpit_start_pitch =
+        cockpit_target_pitch
+
+    cockpit_target_heading =
+        target_heading
+
+    cockpit_target_pitch =
+        target_pitch
+
+end
+
+-- ============================================================
+-- AIRCRAFT-ATTACHED CAMERA TRANSFORM
+-- ============================================================
+
+local function cockpit_deg_to_rad(value)
+    return value * math.pi / 180.0
+end
+
+
+local function cockpit_wrap_heading(value)
+
+    while value > 180.0 do
+        value = value - 360.0
+    end
+
+    while value < -180.0 do
+        value = value + 360.0
+    end
+
+    return value
+
+end
+
+
+-- X-Plane's aircraft coordinate convention:
+-- X = right, Y = up, Z = toward the tail.
+-- This follows the documented OpenGL/aircraft-coordinate rotation order.
+
+local function cockpit_aircraft_to_world(
+    x,
+    y,
+    z,
+    pitch,
+    roll,
+    heading
+)
+
+    local phi =
+        cockpit_deg_to_rad(roll)
+
+    local theta =
+        cockpit_deg_to_rad(pitch)
+
+    local psi =
+        cockpit_deg_to_rad(heading)
+
+
+    -- Roll
+    local x_phi =
+        x * math.cos(phi)
+        + y * math.sin(phi)
+
+    local y_phi =
+        y * math.cos(phi)
+        - x * math.sin(phi)
+
+    local z_phi =
+        z
+
+
+    -- Pitch
+    local x_theta =
+        x_phi
+
+    local y_theta =
+        y_phi * math.cos(theta)
+        - z_phi * math.sin(theta)
+
+    local z_theta =
+        z_phi * math.cos(theta)
+        + y_phi * math.sin(theta)
+
+
+    -- Heading
+    local x_world =
+        x_theta * math.cos(psi)
+        - z_theta * math.sin(psi)
+
+    local y_world =
+        y_theta
+
+    local z_world =
+        z_theta * math.cos(psi)
+        + x_theta * math.sin(psi)
+
+
+    return
+        x_world,
+        y_world,
+        z_world
+
+end
+
+
+local function cockpit_world_to_aircraft(
+    x,
+    y,
+    z,
+    pitch,
+    roll,
+    heading
+)
+
+    local phi =
+        cockpit_deg_to_rad(roll)
+
+    local theta =
+        cockpit_deg_to_rad(pitch)
+
+    local psi =
+        cockpit_deg_to_rad(heading)
+
+
+    -- Inverse heading
+    local x_heading =
+        x * math.cos(psi)
+        + z * math.sin(psi)
+
+    local y_heading =
+        y
+
+    local z_heading =
+        z * math.cos(psi)
+        - x * math.sin(psi)
+
+
+    -- Inverse pitch
+    local x_pitch =
+        x_heading
+
+    local y_pitch =
+        y_heading * math.cos(theta)
+        + z_heading * math.sin(theta)
+
+    local z_pitch =
+        z_heading * math.cos(theta)
+        - y_heading * math.sin(theta)
+
+
+    -- Inverse roll
+    local x_aircraft =
+        x_pitch * math.cos(phi)
+        - y_pitch * math.sin(phi)
+
+    local y_aircraft =
+        y_pitch * math.cos(phi)
+        + x_pitch * math.sin(phi)
+
+    local z_aircraft =
+        z_pitch
+
+
+    return
+        x_aircraft,
+        y_aircraft,
+        z_aircraft
+
+end
+
+
+-- ============================================================
+-- COCKPIT CAMERA CALLBACK
+-- ============================================================
+
+    cockpit_camera_callback = ffi.cast(
+        "XPLMCameraControl_f",
+        function(
+            out_camera,
+            losing_control,
+            refcon
+        )
+
+            if losing_control ~= 0 then
+                cockpit_camera_controlled = false
+                return 0
+            end
+
+
+            if out_camera == nil then
+                return 0
+            end
+
+
+            if not afk_active then
+                return 0
+            end
+
+
+            if director_mode ~= "COCKPIT" then
+                return 0
+            end
+
+
+            -- ----------------------------------------------------
+            -- Time
+            -- ----------------------------------------------------
+
+            local current_time =
+                os.clock()
+
+            local delta_time =
+                current_time
+                - cockpit_last_callback_time
+
+            cockpit_last_callback_time =
+                current_time
+
+
+            if delta_time < 0 then
+                delta_time = 0
+            end
+
+
+            if delta_time > 0.1 then
+                delta_time = 0.1
+            end
+
+
+            cockpit_shot_time =
+                cockpit_shot_time
+                + delta_time
+
+
+            -- ----------------------------------------------------
+            -- Change shot
+            -- ----------------------------------------------------
+
+            function cockpit_random_range(min_value, max_value)
+
+    return min_value
+        + math.random()
+        * (max_value - min_value)
+
+end
+
+
+function cockpit_random_hold()
+
+    return cockpit_random_range(
+        5.0,
+        30.0
+    )
+
+end
+
+
+function cockpit_random_move()
+
+    return cockpit_random_range(
+        2.2,
+        3.0
+    )
+
+end
+
+
+   function cockpit_start_random_shot()
+
+    local choice
+
+    repeat
+        choice = math.random(1, 5)
+    until choice ~= cockpit_last_random_choice
+
+    cockpit_last_random_choice = choice
+
+
+    if choice == 1 then
+
+        -- LOOK LEFT
+
+        local angle =
+            cockpit_random_range(20.0, 28.0)
+
+        cockpit_set_shot(
+            "LOOK LEFT",
+
+            cockpit_base_camera.heading
+            - angle,
+
+            cockpit_base_camera.pitch,
+
+            cockpit_random_move()
+        )
+
+
+    elseif choice == 2 then
+
+        -- LOOK RIGHT
+
+        local angle =
+            cockpit_random_range(20.0, 28.0)
+
+        cockpit_set_shot(
+            "LOOK RIGHT",
+
+            cockpit_base_camera.heading
+            + angle,
+
+            cockpit_base_camera.pitch,
+
+            cockpit_random_move()
+        )
+
+
+    elseif choice == 3 then
+
+        -- LOOK DOWN
+
+        local angle =
+            cockpit_random_range(8.0, 13.0)
+
+        cockpit_set_shot(
+            "LOOK DOWN",
+
+            cockpit_base_camera.heading,
+
+            cockpit_base_camera.pitch
+            - angle,
+
+            cockpit_random_move()
+        )
+
+
+    elseif choice == 4 then
+
+        -- LEFT INSTRUMENT PANEL
+
+        local heading_angle =
+            cockpit_random_range(12.0, 18.0)
+
+        local pitch_angle =
+            cockpit_random_range(6.0, 10.0)
+
+        cockpit_set_shot(
+            "LOOK PANEL LEFT",
+
+            cockpit_base_camera.heading
+            - heading_angle,
+
+            cockpit_base_camera.pitch
+            - pitch_angle,
+
+            cockpit_random_move()
+        )
+
+
+    elseif choice == 5 then
+
+        -- RIGHT INSTRUMENT PANEL
+
+        local heading_angle =
+            cockpit_random_range(12.0, 18.0)
+
+        local pitch_angle =
+            cockpit_random_range(6.0, 10.0)
+
+        cockpit_set_shot(
+            "LOOK PANEL RIGHT",
+
+            cockpit_base_camera.heading
+            + heading_angle,
+
+            cockpit_base_camera.pitch
+            - pitch_angle,
+
+            cockpit_random_move()
+        )
+
+    end
+
+end
+
+    function cockpit_random_center_hold()
+
+        return cockpit_random_range(
+            1.5,
+            3.5
+        )
+
+    end
+
+
+    function cockpit_return_to_center()
+
+        cockpit_set_shot(
+            "CENTER HOLD",
+            cockpit_base_camera.heading,
+            cockpit_base_camera.pitch,
+            cockpit_random_center_hold()
+        )
+
+    end
+
+    if cockpit_shot_time >= cockpit_shot_duration then
+
+        if cockpit_shot == "CENTER" then
+
+            -- Initial center hold finished.
+            -- Pick a random direction.
+
+            cockpit_start_random_shot()
+
+
+        elseif cockpit_shot == "LOOK LEFT" then
+
+            -- LEFT -> HOLD LEFT
+
+            cockpit_set_shot(
+                "HOLD LEFT",
+                cockpit_target_heading,
+                cockpit_target_pitch,
+                cockpit_random_hold()
+            )
+
+
+        elseif cockpit_shot == "HOLD LEFT" then
+
+            -- LEFT -> CENTER
+
+            cockpit_set_shot(
+                "RETURN CENTER LEFT",
+                cockpit_base_camera.heading,
+                cockpit_base_camera.pitch,
+                COCKPIT_MOVE_TIME
+            )
+
+
+        elseif cockpit_shot == "LOOK RIGHT" then
+
+            -- RIGHT -> HOLD RIGHT
+
+            cockpit_set_shot(
+                "HOLD RIGHT",
+                cockpit_target_heading,
+                cockpit_target_pitch,
+                cockpit_random_hold()
+            )
+
+
+        elseif cockpit_shot == "HOLD RIGHT" then
+
+            -- RIGHT -> CENTER
+
+            cockpit_set_shot(
+                "RETURN CENTER RIGHT",
+                cockpit_base_camera.heading,
+                cockpit_base_camera.pitch,
+                COCKPIT_MOVE_TIME
+            )
+
+
+        elseif cockpit_shot == "LOOK DOWN" then
+
+            -- DOWN -> HOLD
+
+            cockpit_set_shot(
+                "HOLD DOWN",
+                cockpit_target_heading,
+                cockpit_target_pitch,
+                cockpit_random_hold()
+            )
+
+
+        elseif cockpit_shot == "HOLD DOWN" then
+
+            -- DOWN -> CENTER
+
+            cockpit_set_shot(
+                "RETURN CENTER DOWN",
+                cockpit_base_camera.heading,
+                cockpit_base_camera.pitch,
+                COCKPIT_MOVE_TIME
+            )
+
+
+        elseif cockpit_shot == "LOOK PANEL LEFT" then
+
+            -- PANEL LEFT -> HOLD
+
+            cockpit_set_shot(
+                "HOLD PANEL LEFT",
+                cockpit_target_heading,
+                cockpit_target_pitch,
+                cockpit_random_hold()
+            )
+
+
+        elseif cockpit_shot == "HOLD PANEL LEFT" then
+
+            -- PANEL LEFT -> CENTER
+
+            cockpit_set_shot(
+                "RETURN CENTER PANEL LEFT",
+                cockpit_base_camera.heading,
+                cockpit_base_camera.pitch,
+                COCKPIT_MOVE_TIME
+            )
+
+
+        elseif cockpit_shot == "LOOK PANEL RIGHT" then
+
+            -- PANEL RIGHT -> HOLD
+
+            cockpit_set_shot(
+                "HOLD PANEL RIGHT",
+                cockpit_target_heading,
+                cockpit_target_pitch,
+                cockpit_random_hold()
+            )
+
+
+        elseif cockpit_shot == "HOLD PANEL RIGHT" then
+
+            -- PANEL RIGHT -> CENTER
+
+            cockpit_set_shot(
+                "RETURN CENTER PANEL RIGHT",
+                cockpit_base_camera.heading,
+                cockpit_base_camera.pitch,
+                COCKPIT_MOVE_TIME
+            )
+
+
+        elseif cockpit_shot == "RETURN CENTER LEFT"
+            or cockpit_shot == "RETURN CENTER RIGHT"
+            or cockpit_shot == "RETURN CENTER DOWN"
+            or cockpit_shot == "RETURN CENTER PANEL LEFT"
+            or cockpit_shot == "RETURN CENTER PANEL RIGHT" then
+
+            -- After every movement, pause in center.
+
+            cockpit_return_to_center()
+
+
+        elseif cockpit_shot == "CENTER HOLD" then
+
+            -- Center pause finished.
+            -- Pick another random shot.
+
+            cockpit_start_random_shot()
+
+        end
+    end
+    
+        -- ----------------------------------------------------
+        -- Calculate transition
+        -- ----------------------------------------------------
+
+        local progress =
+            cockpit_shot_time
+            / cockpit_shot_duration
+
+
+        if progress > 1 then
+            progress = 1
+        end
+
+
+        if progress < 0 then
+            progress = 0
+        end
+
+
+        local smooth_progress =
+            cockpit_smoothstep(progress)
+
+
+        local heading =
+            cockpit_start_heading
+            + (
+                cockpit_target_heading
+                - cockpit_start_heading
+            )
+            * smooth_progress
+
+
+        local pitch =
+            cockpit_start_pitch
+            + (
+                cockpit_target_pitch
+                - cockpit_start_pitch
+            )
+            * smooth_progress
+
+
+        -- ----------------------------------------------------
+        -- Camera position
+        -- ----------------------------------------------------
+        --
+        -- Keep the camera attached to the same physical point
+        -- inside the aircraft. The offset is rotated with the
+        -- aircraft's CURRENT pitch/roll/heading.
+
+        local camera_world_offset_x,
+              camera_world_offset_y,
+              camera_world_offset_z =
+            cockpit_aircraft_to_world(
+                cockpit_camera_offset_x,
+                cockpit_camera_offset_y,
+                cockpit_camera_offset_z,
+                afk_plane_pitch,
+                afk_plane_roll,
+                afk_plane_heading
+            )
+
+
+        out_camera.x =
+            afk_plane_local_x
+            + camera_world_offset_x
+
+        out_camera.y =
+            afk_plane_local_y
+            + camera_world_offset_y
+
+        out_camera.z =
+            afk_plane_local_z
+            + camera_world_offset_z
+
+
+        -- ----------------------------------------------------
+        -- Camera orientation
+        -- ----------------------------------------------------
+        --
+        -- Apply the aircraft's attitude change since AFK began
+        -- to the scripted head movement. This keeps the head
+        -- attached to the airplane during pitch/roll/turns.
+
+        local aircraft_heading_delta =
+            cockpit_wrap_heading(
+                afk_plane_heading
+                - cockpit_base_plane_heading
+            )
+
+        local aircraft_pitch_delta =
+            afk_plane_pitch
+            - cockpit_base_plane_pitch
+
+        local aircraft_roll_delta =
+            afk_plane_roll
+            - cockpit_base_plane_roll
+
+
+        out_camera.heading =
+            cockpit_wrap_heading(
+                heading
+                + aircraft_heading_delta
+            )
+
+        out_camera.pitch =
+            pitch
+            + aircraft_pitch_delta
+
+        out_camera.roll =
+            cockpit_base_camera.roll
+            + aircraft_roll_delta
+
+        out_camera.zoom =
+            cockpit_base_camera.zoom
+
+
+        return 1
+
+    end
+)
+
+-- ============================================================
+-- START COCKPIT CAMERA
+-- ============================================================
+
+function start_cockpit_camera()
+
+    if cockpit_camera_controlled then
+        return
+    end
+
+
+    -- Capture EXACT current camera position
+    XPLM.XPLMReadCameraPosition(
+        cockpit_base_camera
+    )
+
+    -- Capture the aircraft pose at the exact moment AFK begins.
+    cockpit_base_plane_x =
+        afk_plane_local_x
+
+    cockpit_base_plane_y =
+        afk_plane_local_y
+
+    cockpit_base_plane_z =
+        afk_plane_local_z
+
+    cockpit_base_plane_pitch =
+        afk_plane_pitch
+
+    cockpit_base_plane_roll =
+        afk_plane_roll
+
+    cockpit_base_plane_heading =
+        afk_plane_heading
+
+
+    -- Convert the captured camera position into aircraft-relative
+    -- coordinates. This makes the cockpit point follow aircraft
+    -- translation AND rotation.
+    local initial_offset_x =
+        cockpit_base_camera.x
+        - cockpit_base_plane_x
+
+    local initial_offset_y =
+        cockpit_base_camera.y
+        - cockpit_base_plane_y
+
+    local initial_offset_z =
+        cockpit_base_camera.z
+        - cockpit_base_plane_z
+
+
+    cockpit_camera_offset_x,
+    cockpit_camera_offset_y,
+    cockpit_camera_offset_z =
+        cockpit_world_to_aircraft(
+            initial_offset_x,
+            initial_offset_y,
+            initial_offset_z,
+            cockpit_base_plane_pitch,
+            cockpit_base_plane_roll,
+            cockpit_base_plane_heading
+        )
+
+    cockpit_camera_controlled = true
+
+    cockpit_last_callback_time =
+        os.clock()
+
+
+    -- Start the animation from the player's
+    -- exact current camera orientation.
+    cockpit_start_heading =
+        cockpit_base_camera.heading
+
+    cockpit_start_pitch =
+        cockpit_base_camera.pitch
+
+    cockpit_target_heading =
+        cockpit_base_camera.heading
+
+    cockpit_target_pitch =
+        cockpit_base_camera.pitch
+
+
+    cockpit_shot =
+        "CENTER"
+
+    current_shot =
+        "CENTER"
+
+    cockpit_shot_time = 0.0
+
+    cockpit_shot_duration =
+        COCKPIT_CENTER_HOLD
+
+
+    -- Take camera control AFTER the current
+    -- position has been captured.
+    XPLM.XPLMControlCamera(
+        AFK_CAMERA_CONTROL_DURATION,
+        cockpit_camera_callback,
+        nil
+    )
+
+
+    logMsg(
+        "AFK DIRECTOR: "
+        .. "COCKPIT DIRECTOR STARTED"
+    )
+
+end
+
+
+-- ============================================================
+-- STOP COCKPIT CAMERA
+-- ============================================================
+
+function stop_cockpit_camera()
+
+    if not cockpit_camera_controlled then
+        return
+    end
+
+
+    cockpit_camera_controlled = false
+
+
+    -- Give camera ownership back to X-Plane.
+    -- XPRealistic can then resume its camera effects.
+    XPLM.XPLMDontControlCamera()
+
+
+    logMsg(
+        "AFK DIRECTOR: "
+        .. "COCKPIT CAMERA CONTROL RELEASED - "
+        .. "HANDING CAMERA BACK TO XPREALISTIC/X-PLANE"
+    )
+
+end
+
+
+-- ============================================================
+-- STOP EXTERNAL CIRCLE CAMERA
+-- ============================================================
+
+function stop_external_circle_camera()
+
+    if not external_camera_controlled then
+        return
+    end
+
+    external_camera_controlled = false
+
+    -- Return camera ownership to X-Plane / XPRealistic.
+    XPLM.XPLMDontControlCamera()
+
+    logMsg(
+        "AFK DIRECTOR: EXTERNAL CIRCLE CAMERA RELEASED - "
+        .. "HANDING CAMERA BACK TO XPREALISTIC/X-PLANE"
+    )
+
+end
+
+
+-- ============================================================
+-- UNIFIED AFK CAMERA RELEASE
+-- ============================================================
+
+function stop_afk_camera()
+
+    stop_cockpit_camera()
+    stop_external_circle_camera()
+
+end
+
+
+-- ============================================================
+-- EXTERNAL CINEMATIC SHOT HELPERS
+-- ============================================================
+
+function external_prepare_shot(index)
+
+    local shot =
+        AFK_EXTERNAL_SHOTS[index]
+
+    external_shot_index =
+        index
+
+    external_shot_phase =
+        "MOVE"
+
+    external_shot_time =
+        0.0
+
+
+    -- HARD CUT / TELEPORT:
+    -- Each shot has its own independent starting position.
+    -- The camera jumps there immediately.
+
+    external_current_x =
+        shot.start_x
+
+    external_current_y =
+        shot.start_y
+
+    external_current_z =
+        shot.start_z
+
+    external_start_x =
+        shot.start_x
+
+    external_start_y =
+        shot.start_y
+
+    external_start_z =
+        shot.start_z
+
+    external_target_x =
+        shot.end_x
+
+    external_target_y =
+        shot.end_y
+
+    external_target_z =
+        shot.end_z
+
+
+    -- Exact 3D path length -> base duration from the camera speed.
+    -- A minimum duration is then enforced so every cinematic shot
+    -- lasts more than 10 seconds.
+
+    local dx =
+        external_target_x
+        - external_start_x
+
+    local dy =
+        external_target_y
+        - external_start_y
+
+    local dz =
+        external_target_z
+        - external_start_z
+
+    external_shot_distance =
+        math.sqrt(
+            dx * dx
+            + dy * dy
+            + dz * dz
+        )
+
+    if external_shot_distance < 0.01 then
+        external_shot_distance =
+            0.01
+    end
+
+    external_shot_duration =
+        external_shot_distance
+        / AFK_EXTERNAL_SHOT_SPEED
+
+    if external_shot_duration <= AFK_EXTERNAL_MIN_SHOT_DURATION then
+        external_shot_duration =
+            AFK_EXTERNAL_MIN_SHOT_DURATION
+    end
+
+    current_shot =
+        shot.name
+
+    logMsg(
+        "AFK DIRECTOR: CUT TO EXTERNAL SHOT "
+        .. tostring(index)
+        .. "/"
+        .. tostring(#AFK_EXTERNAL_SHOTS)
+        .. " | "
+        .. shot.name
+        .. " | "
+        .. tostring(AFK_EXTERNAL_SHOT_SPEED)
+        .. " M/S BASE | MIN "
+        .. tostring(AFK_EXTERNAL_MIN_SHOT_DURATION)
+        .. " S / SLOW CLOSE"
+    )
+
+end
+
+
+function external_advance_shot()
+
+    -- Select the next shot from the randomized no-repeat bag.
+    local next_index =
+        get_next_external_shot_index()
+
+    external_prepare_shot(
+        next_index
+    )
+
+end
+
+
+-- ============================================================
+-- EXTERNAL CINEMATIC CAMERA CALLBACK
+-- ============================================================
+
+external_camera_callback = ffi.cast(
+    "XPLMCameraControl_f",
+    function(
+        out_camera,
+        losing_control,
+        refcon
+    )
+
+        if losing_control ~= 0 then
+            external_camera_controlled = false
+            return 0
+        end
+
+        if out_camera == nil then
+            return 0
+        end
+
+        if not afk_active
+        or not external_camera_controlled then
+            return 0
+        end
+
+
+        local current_time =
+            os.clock()
+
+        local delta_time =
+            current_time
+            - external_last_callback_time
+
+        external_last_callback_time =
+            current_time
+
+        if delta_time < 0 then
+            delta_time = 0
+        end
+
+        if delta_time > 0.1 then
+            delta_time = 0.1
+        end
+
+
+        -- ----------------------------------------------------
+        -- CONSTANT-SPEED MOVE
+        -- ----------------------------------------------------
+        --
+        -- Linear progress gives one constant physical velocity.
+        -- There is no easing and no hold phase.
+
+        external_shot_time =
+            external_shot_time
+            + delta_time
+
+        local progress =
+            external_shot_time
+            / external_shot_duration
+
+
+        if progress >= 1.0 then
+
+            external_current_x =
+                external_target_x
+
+            external_current_y =
+                external_target_y
+
+            external_current_z =
+                external_target_z
+
+            -- Immediately prepare the next cut.
+            external_advance_shot()
+
+        else
+
+            external_current_x =
+                external_start_x
+                + (
+                    external_target_x
+                    - external_start_x
+                )
+                * progress
+
+            external_current_y =
+                external_start_y
+                + (
+                    external_target_y
+                    - external_start_y
+                )
+                * progress
+
+            external_current_z =
+                external_start_z
+                + (
+                    external_target_z
+                    - external_start_z
+                )
+                * progress
+
+        end
+
+
+        -- ----------------------------------------------------
+        -- Aircraft-relative -> world
+        -- ----------------------------------------------------
+        --
+        -- Follow aircraft heading only so the exterior camera
+        -- stays level and does not inherit pitch/roll.
+
+        local heading_radians =
+            afk_plane_heading
+            * math.pi
+            / 180.0
+
+        local camera_offset_x =
+            external_current_x
+            * math.cos(
+                heading_radians
+            )
+            - external_current_z
+            * math.sin(
+                heading_radians
+            )
+
+        local camera_offset_z =
+            external_current_z
+            * math.cos(
+                heading_radians
+            )
+            + external_current_x
+            * math.sin(
+                heading_radians
+            )
+
+        out_camera.x =
+            afk_plane_local_x
+            + camera_offset_x
+
+        out_camera.y =
+            afk_plane_local_y
+            + external_current_y
+
+        out_camera.z =
+            afk_plane_local_z
+            + camera_offset_z
+
+
+        -- ----------------------------------------------------
+        -- Aim at aircraft visual center
+        -- ----------------------------------------------------
+        --
+        -- The target point is attached to the aircraft itself.
+        -- This is important while the aircraft pitches or banks:
+        -- the camera continues to look at the same physical point
+        -- on the airplane instead of a fixed world-relative point.
+        --
+        -- Reuse the proven aircraft-to-world transform already used
+        -- by the cockpit camera.
+
+        local target_offset_x,
+              target_offset_y,
+              target_offset_z =
+            cockpit_aircraft_to_world(
+                0.0,
+                AFK_EXTERNAL_TARGET_HEIGHT,
+                0.0,
+                afk_plane_pitch,
+                afk_plane_roll,
+                afk_plane_heading
+            )
+
+        local target_x =
+            afk_plane_local_x
+            + target_offset_x
+
+        local target_y =
+            afk_plane_local_y
+            + target_offset_y
+
+        local target_z =
+            afk_plane_local_z
+            + target_offset_z
+
+        local to_target_x =
+            target_x
+            - out_camera.x
+
+        local to_target_y =
+            target_y
+            - out_camera.y
+
+        local to_target_z =
+            target_z
+            - out_camera.z
+
+        local horizontal_distance =
+            math.sqrt(
+                to_target_x * to_target_x
+                + to_target_z * to_target_z
+            )
+
+        if horizontal_distance < 0.1 then
+            horizontal_distance =
+                0.1
+        end
+
+        out_camera.heading =
+            math.deg(
+                math.atan2(
+                    to_target_x,
+                    -to_target_z
+                )
+            )
+
+        out_camera.pitch =
+            math.deg(
+                math.atan2(
+                    to_target_y,
+                    horizontal_distance
+                )
+            )
+
+        out_camera.roll =
+            0.0
+
+        out_camera.zoom =
+            AFK_EXTERNAL_ZOOM
+
+        return 1
+
+    end
+)
+
+
+-- ============================================================
+-- START EXTERNAL CINEMATIC CAMERA
+-- ============================================================
+
+function start_external_circle_camera()
+
+    if external_camera_controlled then
+        return
+    end
+
+    if external_circle_command == nil then
+        logMsg(
+            "AFK DIRECTOR: CANNOT START EXTERNAL CINEMATIC - "
+            .. "CIRCLE COMMAND NOT FOUND"
+        )
+        return
+    end
+
+    XPLM.XPLMCommandOnce(
+        external_circle_command
+    )
+
+    external_last_callback_time =
+        os.clock()
+
+    external_camera_controlled =
+        true
+
+    -- First shot is also selected from the randomized no-repeat bag.
+    external_prepare_shot(
+        get_next_external_shot_index()
+    )
+
+    XPLM.XPLMControlCamera(
+        AFK_CAMERA_CONTROL_DURATION,
+        external_camera_callback,
+        nil
+    )
+
+    logMsg(
+        "AFK DIRECTOR: EXTERNAL CINEMATIC "
+        .. "CENTERED RANDOM NO-REPEAT SHOTS STARTED"
+    )
+
+end
+
+
+-- ============================================================
+-- ENTER AFK
+-- ============================================================
+
+function enter_afk()
+
+    if afk_active then
+        return
+    end
+
+    -- IMPORTANT:
+    -- Capture the player's actual view BEFORE starting any camera
+    -- command. This prevents cockpit AFK from being redirected to
+    -- the external cinematic camera.
+    update_director_mode()
+
+    afk_active = true
+    afk_status = "AFK"
+    last_activity = "AFK Started"
+
+    if director_mode == "COCKPIT" then
+
+        current_shot = "CENTER"
+        start_cockpit_camera()
+
+        logMsg(
+            "AFK DIRECTOR: ENTERED AFK MODE | "
+            .. "COCKPIT DIRECTOR"
+        )
+
+    elseif director_mode == "EXTERNAL" then
+
+        current_shot = "EXTERNAL CINEMATIC"
+        start_external_circle_camera()
+
+        logMsg(
+            "AFK DIRECTOR: ENTERED AFK MODE | "
+            .. "EXTERNAL CINEMATIC"
+        )
+
+    else
+
+        current_shot = "NONE"
+
+        logMsg(
+            "AFK DIRECTOR: ENTERED AFK MODE | "
+            .. "NO CAMERA CONTROL | VIEW TYPE "
+            .. tostring(afk_view_type)
+        )
+
+    end
+
+end
+
+
+-- ============================================================
+-- TEST COMMAND
+-- ============================================================
+
+function afk_test_command()
+
+    player_activity(
+        "Test Command"
+    )
+
+end
+
+
+create_command(
+    "AFKDirector/test_activity",
+    "AFK Director Test Activity",
+    "afk_test_command()",
+    "",
+    ""
+)
+
+
+-- ============================================================
+-- MAIN LOOP
+-- ============================================================
+
+function afk_director_update()
+
+    poll_mouse_buttons()
+
+    poll_mouse_yoke_input()
+
+    poll_joystick_input()
+
+    update_director_mode()
+
+
+    -- --------------------------------------------------------
+    -- Delta time
+    -- --------------------------------------------------------
+
+    local current_time =
+        os.clock()
+
+    local delta_time =
+        current_time
+        - last_update_time
+
+    last_update_time =
+        current_time
+
+
+    if delta_time < 0 then
+        delta_time = 0
+    end
+
+
+    if delta_time > 1 then
+        delta_time = 1
+    end
+
+
+    -- --------------------------------------------------------
+    -- X-Plane mouse joystick
+    -- --------------------------------------------------------
+
+    if handle_mouse_yoke_activity() then
+        return
+    end
+
+
+    -- --------------------------------------------------------
+    -- Physical joystick input
+    -- --------------------------------------------------------
+
+    if handle_joystick_activity() then
+        return
+    end
+
+
+    -- --------------------------------------------------------
+    -- Right mouse button
+    -- --------------------------------------------------------
+
+    if handle_right_mouse_activity() then
+        return
+    end
+
+
+    -- --------------------------------------------------------
+    -- Mouse input
+    -- --------------------------------------------------------
+
+    if mouse_input_detected then
+
+        idle_time = 0.0
+
+        last_activity =
+            "Mouse input"
+
+
+        if afk_active then
+
+            afk_active = false
+
+            afk_status = "ACTIVE"
+
+            current_shot = "NONE"
+
+
+            stop_afk_camera()
+
+
+            logMsg(
+                "AFK DIRECTOR: "
+                .. "EXITED AFK MODE - MOUSE INPUT"
+            )
+
+        end
+
+
+        mouse_input_detected = false
+
+
+        return
+
+    end
+
+
+    -- --------------------------------------------------------
+    -- Camera movement
+    -- --------------------------------------------------------
+
+    if handle_keyboard_activity() then
+        return
+    end
+
+
+    -- --------------------------------------------------------
+    -- CAMERA OWNERSHIP SAFETY
+    -- --------------------------------------------------------
+    --
+    -- Outside AFK mode, this script must never retain camera
+    -- ownership. This catches any path that clears AFK state
+    -- without going through the normal release handler.
+    if not afk_active
+    and (
+        cockpit_camera_controlled
+        or external_camera_controlled
+    ) then
+
+        stop_afk_camera()
+
+    end
+
+
+    -- --------------------------------------------------------
+    -- AFK TIMER
+    -- --------------------------------------------------------
+
+    if not afk_active then
+
+        idle_time =
+            idle_time + delta_time
+
+
+        if idle_time >= AFK_TIMEOUT then
+
+            enter_afk()
+
+        end
+
+    end
+
+end
+
+
+do_every_frame(
+    "afk_director_update()"
+)
+
+
+-- ============================================================
+-- VIEW DETECTION
+-- ============================================================
+
+function get_view_name()
+
+    if afk_view_type == 1026 then
+
+        return "COCKPIT"
+
+    elseif afk_view_type == 1018 then
+
+        return "EXTERNAL CIRCLE"
+
+    elseif afk_view_type == 1028 then
+
+        return "FREE CAM"
+
+    elseif afk_view_type == 1015 then
+
+        return "RUNWAY"
+
+    elseif afk_view_type == 1020 then
+
+        return "STILL SPOT"
+
+    else
+
+        return "UNKNOWN ("
+        .. tostring(afk_view_type)
+        .. ")"
+
+    end
+
+end
+
+
+-- ============================================================
+-- DEBUG HUD
+-- ============================================================
+
+function afk_debug_display()
+
+    draw_string(
+        30,
+        700,
+        "AFK DIRECTOR"
+    )
+
+
+    draw_string(
+        30,
+        680,
+        "Status: "
+        .. afk_status
+    )
+
+
+    draw_string(
+        30,
+        660,
+        "Idle: "
+        .. string.format(
+            "%.1f",
+            idle_time
+        )
+        .. " / "
+        .. AFK_TIMEOUT
+    )
+
+
+    draw_string(
+        30,
+        640,
+        "Camera: "
+        .. camera_status
+    )
+
+
+    draw_string(
+        30,
+        620,
+        "Movement Threshold: "
+        .. CAMERA_MOVEMENT_THRESHOLD
+        .. " deg"
+    )
+
+
+    draw_string(
+        30,
+        600,
+        "Heading: "
+        .. string.format(
+            "%.2f",
+            afk_view_heading
+        )
+    )
+
+
+    draw_string(
+        30,
+        580,
+        "Pitch: "
+        .. string.format(
+            "%.2f",
+            afk_view_pitch
+        )
+    )
+
+
+    draw_string(
+        30,
+        560,
+        "Roll: "
+        .. string.format(
+            "%.2f",
+            afk_view_roll
+        )
+    )
+
+
+    draw_string(
+        30,
+        530,
+        "LAST ACTIVITY"
+    )
+
+
+    draw_string(
+        30,
+        510,
+        last_activity
+    )
+
+
+    draw_string(
+        30,
+        460,
+        "View Type: "
+        .. get_view_name()
+    )
+
+
+    draw_string(
+        30,
+        440,
+        "Director: "
+        .. director_mode
+    )
+
+
+    draw_string(
+        30,
+        420,
+        "Current Shot: "
+        .. current_shot
+    )
+
+    if external_camera_controlled then
+
+        draw_string(
+            30,
+            380,
+            "Cinematic Cut: "
+            .. tostring(
+                external_shot_index
+            )
+            .. " / "
+            .. tostring(
+                #AFK_EXTERNAL_SHOTS
+            )
+        )
+
+    end
+
+
+    local camera_owner =
+        "XPRealistic / X-Plane"
+
+    if cockpit_camera_controlled
+    or external_camera_controlled then
+
+        camera_owner =
+            "AFK Director"
+
+    end
+
+
+    draw_string(
+        30,
+        400,
+        "Camera Owner: "
+        .. camera_owner
+    )
+
+end
+
+
+do_every_draw(
+    "afk_debug_display()"
+)
+
+
+-- ============================================================
+-- KEYBOARD ACTIVITY
+-- ============================================================
+
+function handle_keyboard_activity()
+
+    if not keyboard_input_detected then
+        return false
+    end
+
+    keyboard_input_detected = false
+
+    idle_time = 0.0
+    last_activity = "Keyboard input"
+
+    if afk_active then
+
+        afk_active = false
+        afk_status = "ACTIVE"
+        current_shot = "NONE"
+
+        stop_afk_camera()
+
+        logMsg(
+            "AFK DIRECTOR: EXITED AFK MODE - KEYBOARD INPUT"
+        )
+
+    end
+
+    return true
+
+end
+
+
+-- ============================================================
+-- MOUSE INPUT
+-- ============================================================
+
+function afk_mouse_click()
+
+    mouse_input_detected = true
+
+end
+
+
+function afk_mouse_wheel()
+
+    mouse_input_detected = true
+
+end
+
+
+do_on_mouse_click(
+    "afk_mouse_click()"
+)
+
+
+do_on_mouse_wheel(
+    "afk_mouse_wheel()"
+)
+
+
+-- ============================================================
+-- STARTUP
+-- ============================================================
+
+logMsg(
+    "===================================="
+)
+
+logMsg(
+    "AFK DIRECTOR PHASE 5"
+)
+
+logMsg(
+    "AFK timeout: "
+    .. AFK_TIMEOUT
+    .. " seconds"
+)
+
+logMsg(
+    "Camera threshold: "
+    .. CAMERA_MOVEMENT_THRESHOLD
+    .. " degrees"
+)
+
+logMsg(
+    "FFI camera control: AFK ONLY"
+)
+
+logMsg(
+    "Normal flight camera owner: XPRealistic / X-Plane"
+)
+
+logMsg(
+    "AFK camera owner: AFK Director"
+)
+
+logMsg(
+    "AFK exterior mode: Constant-speed cinematic cut shots"
+)
+
+logMsg(
+    "===================================="
+)
