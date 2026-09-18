@@ -455,6 +455,13 @@ local user32 =
 
 ffi.cdef[[
 short GetAsyncKeyState(int vKey);
+
+typedef struct {
+    long x;
+    long y;
+} AFK_POINT;
+
+int GetCursorPos(AFK_POINT *lpPoint);
 ]]
 
 local VK_LBUTTON =
@@ -774,6 +781,254 @@ end
 
 
 initialise_mouse_yoke_values()
+
+
+-- ============================================================
+-- BETTER MOUSE YOKE INPUT
+-- ============================================================
+--
+-- Better Mouse Yoke uses these X-Plane control DataRefs:
+--   sim/cockpit2/controls/yoke_pitch_ratio
+--   sim/cockpit2/controls/yoke_roll_ratio
+--
+-- Its flight loop derives those values directly from the
+-- Windows mouse position. We therefore require BOTH:
+--   1) the cursor to move, and
+--   2) the yoke ratio to change.
+--
+-- This makes the AFK timer recognize actual Better Mouse Yoke
+-- movement without treating ordinary autopilot/aircraft yoke
+-- changes as mouse input.
+
+dataref(
+    "afk_bmy_yoke_pitch",
+    "sim/cockpit2/controls/yoke_pitch_ratio",
+    "readonly"
+)
+
+dataref(
+    "afk_bmy_yoke_roll",
+    "sim/cockpit2/controls/yoke_roll_ratio",
+    "readonly"
+)
+
+local BETTER_MOUSE_YOKE_CHANGE_THRESHOLD =
+    0.0025
+
+local better_mouse_yoke_initialised =
+    false
+
+local better_mouse_yoke_previous_pitch =
+    0.0
+
+local better_mouse_yoke_previous_roll =
+    0.0
+
+local better_mouse_yoke_previous_cursor_x =
+    0
+
+local better_mouse_yoke_previous_cursor_y =
+    0
+
+local better_mouse_yoke_input_detected =
+    false
+
+local better_mouse_yoke_input_type =
+    "Better Mouse Yoke"
+
+
+function initialise_better_mouse_yoke_values()
+
+    local point =
+        ffi.new("AFK_POINT[1]")
+
+    if user32.GetCursorPos(point) == 0 then
+        return
+    end
+
+    better_mouse_yoke_previous_pitch =
+        tonumber(
+            afk_bmy_yoke_pitch
+        ) or 0.0
+
+    better_mouse_yoke_previous_roll =
+        tonumber(
+            afk_bmy_yoke_roll
+        ) or 0.0
+
+    better_mouse_yoke_previous_cursor_x =
+        tonumber(
+            point[0].x
+        ) or 0
+
+    better_mouse_yoke_previous_cursor_y =
+        tonumber(
+            point[0].y
+        ) or 0
+
+    better_mouse_yoke_initialised =
+        true
+
+end
+
+
+function poll_better_mouse_yoke_input()
+
+    local point =
+        ffi.new("AFK_POINT[1]")
+
+    if user32.GetCursorPos(point) == 0 then
+        return
+    end
+
+
+    local pitch =
+        tonumber(
+            afk_bmy_yoke_pitch
+        ) or 0.0
+
+    local roll =
+        tonumber(
+            afk_bmy_yoke_roll
+        ) or 0.0
+
+    local cursor_x =
+        tonumber(
+            point[0].x
+        ) or 0
+
+    local cursor_y =
+        tonumber(
+            point[0].y
+        ) or 0
+
+
+    if not better_mouse_yoke_initialised then
+
+        better_mouse_yoke_previous_pitch =
+            pitch
+
+        better_mouse_yoke_previous_roll =
+            roll
+
+        better_mouse_yoke_previous_cursor_x =
+            cursor_x
+
+        better_mouse_yoke_previous_cursor_y =
+            cursor_y
+
+        better_mouse_yoke_initialised =
+            true
+
+        return
+
+    end
+
+
+    local cursor_moved =
+        cursor_x
+            ~= better_mouse_yoke_previous_cursor_x
+        or cursor_y
+            ~= better_mouse_yoke_previous_cursor_y
+
+
+    if cursor_moved then
+
+        local pitch_change =
+            math.abs(
+                pitch
+                    - better_mouse_yoke_previous_pitch
+            )
+
+        local roll_change =
+            math.abs(
+                roll
+                    - better_mouse_yoke_previous_roll
+            )
+
+
+        if pitch_change >
+            BETTER_MOUSE_YOKE_CHANGE_THRESHOLD then
+
+            better_mouse_yoke_input_detected =
+                true
+
+            better_mouse_yoke_input_type =
+                "Better Mouse Yoke Pitch"
+
+        elseif roll_change >
+            BETTER_MOUSE_YOKE_CHANGE_THRESHOLD then
+
+            better_mouse_yoke_input_detected =
+                true
+
+            better_mouse_yoke_input_type =
+                "Better Mouse Yoke Roll"
+
+        end
+
+    end
+
+
+    better_mouse_yoke_previous_pitch =
+        pitch
+
+    better_mouse_yoke_previous_roll =
+        roll
+
+    better_mouse_yoke_previous_cursor_x =
+        cursor_x
+
+    better_mouse_yoke_previous_cursor_y =
+        cursor_y
+
+end
+
+
+function handle_better_mouse_yoke_activity()
+
+    if not better_mouse_yoke_input_detected then
+        return false
+    end
+
+
+    better_mouse_yoke_input_detected =
+        false
+
+    idle_time =
+        0.0
+
+    last_activity =
+        better_mouse_yoke_input_type
+
+
+    if afk_active then
+
+        afk_active =
+            false
+
+        afk_status =
+            "ACTIVE"
+
+        current_shot =
+            "NONE"
+
+        stop_afk_camera()
+
+        logMsg(
+            "AFK DIRECTOR: "
+            .. "EXITED AFK MODE - "
+            .. better_mouse_yoke_input_type
+        )
+
+    end
+
+    return true
+
+end
+
+
+initialise_better_mouse_yoke_values()
 
 
 -- ============================================================
@@ -2630,6 +2885,8 @@ function afk_director_update()
 
     poll_mouse_yoke_input()
 
+    poll_better_mouse_yoke_input()
+
     poll_joystick_input()
 
     update_director_mode()
@@ -2657,6 +2914,15 @@ function afk_director_update()
 
     if delta_time > 1 then
         delta_time = 1
+    end
+
+
+    -- --------------------------------------------------------
+    -- Better Mouse Yoke
+    -- --------------------------------------------------------
+
+    if handle_better_mouse_yoke_activity() then
+        return
     end
 
 
