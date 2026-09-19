@@ -164,7 +164,7 @@ AFK Camera does **not** enable or disable Better Mouse Yoke itself.
 
 Better Mouse Yoke project:
 
-- https://forums.x-plane.org/files/file/51810-bettermouseyoke/
+- https://forums.x-plane.org/files/file/100265-bettermouseyoke-xplane12-win-mac-lin/
 
 ---
 
@@ -413,7 +413,7 @@ Built for the X-Plane 12 community with FlyWithLua.
 Third-party projects used / supported by the setup:
 
 - FlyWithLua - https://forums.x-plane.org/files/file/82888-flywithlua-ng-next-generation-plus-edition-for-x-plane-12-win-lin-mac/
-- Better Mouse Yoke - https://forums.x-plane.org/files/file/51810-bettermouseyoke/
+- Better Mouse Yoke - https://forums.x-plane.org/files/file/100265-bettermouseyoke-xplane12-win-mac-lin/
 
 ---
 
