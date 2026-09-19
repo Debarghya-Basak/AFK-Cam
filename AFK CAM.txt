@@ -1,6 +1,7 @@
 -- ============================================================
--- AFK DIRECTOR
--- Phase 5 - FFI Cockpit Camera Control
+-- AFK CAMERA
+-- Phase 6 - menu added and bug fixes
+-- MADE BY DEBARGHYA BASAK
 -- ============================================================
 
 
@@ -8,18 +9,244 @@
 -- SETTINGS
 -- ============================================================
 
-local AFK_TIMEOUT = 3.0
+-- ============================================================
+-- DEFAULT USER SETTINGS
+-- ============================================================
+--
+-- Change these values to define what "Restore Defaults" uses.
+-- These are intentionally kept separate from the live settings.
+--
+-- Examples:
+--   true  = AFK Camera starts enabled
+--   false = AFK Camera starts disabled
+--
+-- AFK timeout is in seconds.
+
+local DEFAULT_AFK_ENABLED = true
+local DEFAULT_AFK_TIMEOUT = 3.0
+
+
+local AFK_TIMEOUT = DEFAULT_AFK_TIMEOUT
+
+
+-- ------------------------------------------------------------
+-- USER SETTINGS / PERSISTENCE
+-- ------------------------------------------------------------
+--
+-- Settings are stored next to this Lua script so they survive
+-- X-Plane/FlyWithLua reloads. The UI changes the live value
+-- immediately; "Save Settings" writes it to disk.
+--
+-- File:
+--   AFKCamera_settings.ini
+
+local AFK_SETTINGS_FILE =
+    SCRIPT_DIRECTORY
+    .. "/AFKCamera_settings.ini"
+
+local afk_enabled = true
+
+local AFK_TIMEOUT_MIN = 3.0
+local AFK_TIMEOUT_MAX = 300.0
+
+
+function clamp_afk_timeout(value)
+
+    local v =
+        tonumber(value)
+
+    if v == nil then
+        return 3.0
+    end
+
+    if v < AFK_TIMEOUT_MIN then
+        v = AFK_TIMEOUT_MIN
+    end
+
+    if v > AFK_TIMEOUT_MAX then
+        v = AFK_TIMEOUT_MAX
+    end
+
+    return v
+
+end
+
+
+function load_afk_settings()
+
+    local file =
+        io.open(
+            AFK_SETTINGS_FILE,
+            "r"
+        )
+
+    if not file then
+        return
+    end
+
+
+    for line in file:lines() do
+
+        local key, value =
+            line:match(
+                "^%s*([^=]+)%s*=%s*(.-)%s*$"
+            )
+
+        if key and value then
+
+            key =
+                key:lower()
+
+            if key == "enabled" then
+
+                local normalized =
+                    value:lower()
+
+                afk_enabled =
+                    normalized == "1"
+                    or normalized == "true"
+                    or normalized == "yes"
+
+            elseif key == "timeout" then
+
+                AFK_TIMEOUT =
+                    clamp_afk_timeout(
+                        value
+                    )
+
+            end
+
+        end
+
+    end
+
+    file:close()
+
+end
+
+
+function restore_afk_defaults()
+
+    afk_enabled =
+        DEFAULT_AFK_ENABLED
+
+    AFK_TIMEOUT =
+        clamp_afk_timeout(
+            DEFAULT_AFK_TIMEOUT
+        )
+
+    idle_time =
+        0.0
+
+    -- Restoring defaults while AFK should immediately leave AFK
+    -- so the user gets a clean, predictable state.
+    if afk_active then
+
+        afk_active =
+            false
+
+        afk_status =
+            "ACTIVE"
+
+        current_shot =
+            "NONE"
+
+        stop_afk_camera()
+
+        last_activity =
+            "Defaults restored"
+
+    end
+
+    logMsg(
+        "AFK CAMERA: DEFAULTS RESTORED | "
+        .. "Enabled="
+        .. tostring(
+            afk_enabled
+        )
+        .. " | Timeout="
+        .. string.format(
+            "%.0f",
+            AFK_TIMEOUT
+        )
+        .. " s"
+    )
+
+end
+
+
+function save_afk_settings()
+
+    local file =
+        io.open(
+            AFK_SETTINGS_FILE,
+            "w"
+        )
+
+    if not file then
+
+        logMsg(
+            "AFK CAMERA: ERROR - "
+            .. "Could not save settings to "
+            .. AFK_SETTINGS_FILE
+        )
+
+        return false
+
+    end
+
+
+    file:write(
+        "enabled=",
+        afk_enabled and "1" or "0",
+        "\n"
+    )
+
+    file:write(
+        "timeout=",
+        string.format(
+            "%.0f",
+            AFK_TIMEOUT
+        ),
+        "\n"
+    )
+
+    file:close()
+
+
+    logMsg(
+        "AFK CAMERA: SETTINGS SAVED | "
+        .. "Enabled="
+        .. tostring(afk_enabled)
+        .. " | Timeout="
+        .. string.format(
+            "%.0f",
+            AFK_TIMEOUT
+        )
+        .. " s"
+    )
+
+    return true
+
+end
+
+
+load_afk_settings()
 
 -- Camera ownership policy:
--- NORMAL FLIGHT: AFK Director NEVER controls the camera.
+-- NORMAL FLIGHT: AFK Camera NEVER controls the camera.
 --                 XPRealistic / X-Plane remains in charge.
--- AFK MODE:      AFK Director takes camera control.
--- EXIT AFK:      AFK Director explicitly releases control.
+-- AFK MODE:      AFK Camera takes camera control.
+-- EXIT AFK:      AFK Camera explicitly releases control.
 --
 -- X-Plane SDK camera-control duration:
 --   1 = until view changes
 --   2 = forever / until another plugin forcibly takes control
-local AFK_CAMERA_CONTROL_DURATION = 2
+--
+-- The exterior camera uses "until view changes" so X-Plane can
+-- safely revoke camera ownership as soon as the user selects
+-- another view.
+local AFK_CAMERA_CONTROL_DURATION = 1
 
 -- AFK exterior cinematic camera settings.
 --
@@ -293,11 +520,11 @@ local external_circle_command =
 
 if external_circle_command == nil then
     logMsg(
-        "AFK DIRECTOR: FAILED TO FIND sim/view/circle"
+        "AFK CAMERA: FAILED TO FIND sim/view/circle"
     )
 else
     logMsg(
-        "AFK DIRECTOR: EXTERNAL CIRCLE COMMAND FOUND"
+        "AFK CAMERA: EXTERNAL CIRCLE COMMAND FOUND"
     )
 end
 
@@ -350,6 +577,13 @@ end
 
 
 local external_camera_controlled =
+    false
+
+-- Set by the native XPLM camera callback when X-Plane takes
+-- ownership back, normally because the user changed the view.
+-- Cleanup is performed from the normal FlyWithLua frame loop,
+-- never from the camera callback itself.
+local external_camera_ownership_lost =
     false
 
 local external_camera_callback
@@ -432,9 +666,9 @@ local keyboard_sniffer_result =
     )
 
 if keyboard_sniffer_result == 1 then
-    logMsg("AFK DIRECTOR: KEYBOARD SNIFFER REGISTERED")
+    logMsg("AFK CAMERA: KEYBOARD SNIFFER REGISTERED")
 else
-    logMsg("AFK DIRECTOR: KEYBOARD SNIFFER REGISTRATION FAILED")
+    logMsg("AFK CAMERA: KEYBOARD SNIFFER REGISTRATION FAILED")
 end
 
 -- ============================================================
@@ -559,7 +793,7 @@ function handle_right_mouse_activity()
         stop_afk_camera()
 
         logMsg(
-            "AFK DIRECTOR: "
+            "AFK CAMERA: "
             .. "EXITED AFK MODE - "
             .. "RIGHT MOUSE INPUT"
         )
@@ -767,7 +1001,7 @@ function handle_mouse_yoke_activity()
         stop_afk_camera()
 
         logMsg(
-            "AFK DIRECTOR: "
+            "AFK CAMERA: "
             .. "EXITED AFK MODE - "
             .. mouse_yoke_input_type
         )
@@ -1016,7 +1250,7 @@ function handle_better_mouse_yoke_activity()
         stop_afk_camera()
 
         logMsg(
-            "AFK DIRECTOR: "
+            "AFK CAMERA: "
             .. "EXITED AFK MODE - "
             .. better_mouse_yoke_input_type
         )
@@ -1285,7 +1519,7 @@ function handle_joystick_activity()
         stop_afk_camera()
 
         logMsg(
-            "AFK DIRECTOR: "
+            "AFK CAMERA: "
             .. "EXITED AFK MODE - "
             .. joystick_input_type
         )
@@ -1309,7 +1543,7 @@ initialise_joystick_values()
 
 -- Retain this flag name to minimize changes elsewhere in the
 -- project. In cockpit mode it now means "AFK cockpit director
--- active", not "AFK Director owns the camera".
+-- active", not "AFK Camera owns the camera".
 local cockpit_camera_controlled = false
 
 local cockpit_base_head_x = 0.0
@@ -1319,6 +1553,11 @@ local cockpit_base_head_z = 0.0
 local cockpit_base_head_psi = 0.0
 local cockpit_base_head_the = 0.0
 local cockpit_base_head_phi = 0.0
+
+-- The view type present when AFK starts. Cockpit AFK does not
+-- own the XPLM camera, so this lets us cleanly detect a manual
+-- view change while the cockpit director is active.
+local afk_entry_view_type = nil
 
 -- Aircraft pose captured at AFK entry.
 local cockpit_base_plane_x = 0.0
@@ -1452,15 +1691,17 @@ function player_activity(activity)
 
         current_shot = "NONE"
 
+        afk_entry_view_type = nil
 
-        -- Release camera control ONLY if AFK Director currently
+
+        -- Release camera control ONLY if AFK Camera currently
         -- owns the camera. This hands ownership back to X-Plane,
         -- allowing XPRealistic to resume its camera effects.
         stop_afk_camera()
 
 
         logMsg(
-            "AFK DIRECTOR: EXIT - "
+            "AFK CAMERA: EXIT - "
             .. activity
         )
 
@@ -2255,7 +2496,7 @@ function start_cockpit_camera()
     -- Do not call XPLMControlCamera() here.
     -- X-Plane's normal cockpit camera remains active.
     logMsg(
-        "AFK DIRECTOR: "
+        "AFK CAMERA: "
         .. "COCKPIT DIRECTOR STARTED - "
         .. "NORMAL X-PLANE CAMERA / XPREALISTIC COMPATIBLE"
     )
@@ -2299,7 +2540,7 @@ function stop_cockpit_camera()
     -- No XPLMDontControlCamera() call here because cockpit AFK
     -- never took control of the X-Plane camera.
     logMsg(
-        "AFK DIRECTOR: "
+        "AFK CAMERA: "
         .. "COCKPIT DIRECTOR STOPPED - "
         .. "X-PLANE / XPREALISTIC CAMERA UNTOUCHED"
     )
@@ -2314,16 +2555,25 @@ end
 function stop_external_circle_camera()
 
     if not external_camera_controlled then
+
+        external_camera_ownership_lost =
+            false
+
         return
+
     end
 
-    external_camera_controlled = false
+    external_camera_controlled =
+        false
 
-    -- Return camera ownership to X-Plane / XPRealistic.
+    external_camera_ownership_lost =
+        false
+
+    -- We still own the camera here, so releasing ownership is safe.
     XPLM.XPLMDontControlCamera()
 
     logMsg(
-        "AFK DIRECTOR: EXTERNAL CIRCLE CAMERA RELEASED - "
+        "AFK CAMERA: EXTERNAL CIRCLE CAMERA RELEASED - "
         .. "HANDING CAMERA BACK TO XPREALISTIC/X-PLANE"
     )
 
@@ -2482,7 +2732,7 @@ function external_prepare_shot(index)
         shot.name
 
     logMsg(
-        "AFK DIRECTOR: CUT TO EXTERNAL SHOT "
+        "AFK CAMERA: CUT TO EXTERNAL SHOT "
         .. tostring(index)
         .. "/"
         .. tostring(#AFK_EXTERNAL_SHOTS)
@@ -2526,8 +2776,17 @@ external_camera_callback = ffi.cast(
     )
 
         if losing_control ~= 0 then
-            external_camera_controlled = false
+
+            -- X-Plane has already taken the camera back.
+            -- Do not call XPLMDontControlCamera() here.
+            external_camera_controlled =
+                false
+
+            external_camera_ownership_lost =
+                true
+
             return 0
+
         end
 
         if out_camera == nil then
@@ -2763,7 +3022,7 @@ function start_external_circle_camera()
 
     if external_circle_command == nil then
         logMsg(
-            "AFK DIRECTOR: CANNOT START EXTERNAL CINEMATIC - "
+            "AFK CAMERA: CANNOT START EXTERNAL CINEMATIC - "
             .. "CIRCLE COMMAND NOT FOUND"
         )
         return
@@ -2772,6 +3031,9 @@ function start_external_circle_camera()
     XPLM.XPLMCommandOnce(
         external_circle_command
     )
+
+    external_camera_ownership_lost =
+        false
 
     external_last_callback_time =
         os.clock()
@@ -2791,7 +3053,7 @@ function start_external_circle_camera()
     )
 
     logMsg(
-        "AFK DIRECTOR: EXTERNAL CINEMATIC "
+        "AFK CAMERA: EXTERNAL CINEMATIC "
         .. "CENTERED RANDOM NO-REPEAT SHOTS STARTED"
     )
 
@@ -2814,6 +3076,9 @@ function enter_afk()
     -- the external cinematic camera.
     update_director_mode()
 
+    afk_entry_view_type =
+        afk_view_type
+
     afk_active = true
     afk_status = "AFK"
     last_activity = "AFK Started"
@@ -2824,7 +3089,7 @@ function enter_afk()
         start_cockpit_camera()
 
         logMsg(
-            "AFK DIRECTOR: ENTERED AFK MODE | "
+            "AFK CAMERA: ENTERED AFK MODE | "
             .. "COCKPIT DIRECTOR"
         )
 
@@ -2834,7 +3099,7 @@ function enter_afk()
         start_external_circle_camera()
 
         logMsg(
-            "AFK DIRECTOR: ENTERED AFK MODE | "
+            "AFK CAMERA: ENTERED AFK MODE | "
             .. "EXTERNAL CINEMATIC"
         )
 
@@ -2843,7 +3108,7 @@ function enter_afk()
         current_shot = "NONE"
 
         logMsg(
-            "AFK DIRECTOR: ENTERED AFK MODE | "
+            "AFK CAMERA: ENTERED AFK MODE | "
             .. "NO CAMERA CONTROL | VIEW TYPE "
             .. tostring(afk_view_type)
         )
@@ -2868,8 +3133,527 @@ end
 
 create_command(
     "AFKDirector/test_activity",
-    "AFK Director Test Activity",
+    "AFK Camera Test Activity",
     "afk_test_command()",
+    "",
+    ""
+)
+
+
+-- ============================================================
+-- SETTINGS UI
+-- ============================================================
+
+local afk_settings_wnd = nil
+
+local afk_settings_save_message =
+    ""
+
+local afk_settings_save_message_time =
+    0.0
+
+
+function afk_settings_show_wnd()
+
+    if not SUPPORTS_FLOATING_WINDOWS then
+
+        logMsg(
+            "AFK CAMERA: IMGUI/FLOATING WINDOWS "
+            .. "ARE NOT SUPPORTED BY THIS FLYWITHLUA VERSION"
+        )
+
+        return
+
+    end
+
+
+    if afk_settings_wnd
+       and float_wnd_get_visible(
+           afk_settings_wnd
+       ) then
+
+        float_wnd_bring_to_front(
+            afk_settings_wnd
+        )
+
+        return
+
+    end
+
+
+    afk_settings_wnd =
+        float_wnd_create(
+            460,
+            330,
+            1,
+            true
+        )
+
+    float_wnd_set_title(
+        afk_settings_wnd,
+        "AFK Camera Settings"
+    )
+
+    float_wnd_set_imgui_builder(
+        afk_settings_wnd,
+        "afk_settings_on_build"
+    )
+
+    float_wnd_set_onclose(
+        afk_settings_wnd,
+        "afk_settings_on_close"
+    )
+
+end
+
+
+function afk_settings_hide_wnd()
+
+    if afk_settings_wnd then
+
+        float_wnd_destroy(
+            afk_settings_wnd
+        )
+
+        afk_settings_wnd =
+            nil
+
+    end
+
+end
+
+
+function afk_settings_toggle_wnd()
+
+    if afk_settings_wnd
+       and float_wnd_get_visible(
+           afk_settings_wnd
+       ) then
+
+        afk_settings_hide_wnd()
+
+    else
+
+        afk_settings_show_wnd()
+
+    end
+
+end
+
+
+function afk_settings_on_close(wnd)
+
+    -- The FlyWithLua close callback must not use the window
+    -- handle after the callback. We only clear our Lua reference.
+    afk_settings_wnd =
+        nil
+
+end
+
+
+function afk_settings_on_build(wnd, x, y)
+
+    imgui.TextUnformatted(
+        "AFK Camera"
+    )
+
+    imgui.TextUnformatted(
+        "Automatic cinematic camera after inactivity."
+    )
+
+    imgui.Separator()
+
+
+    -- --------------------------------------------------------
+    -- ENABLE / DISABLE
+    -- --------------------------------------------------------
+
+    local changed, new_enabled =
+        imgui.Checkbox(
+            "Enable AFK Camera",
+            afk_enabled
+        )
+
+    if changed then
+
+        afk_enabled =
+            new_enabled
+
+        idle_time =
+            0.0
+
+        if not afk_enabled then
+
+            -- Disabling the plugin must immediately release
+            -- any camera control and stop the AFK state.
+            if afk_active then
+
+                afk_active =
+                    false
+
+                afk_status =
+                    "DISABLED"
+
+                current_shot =
+                    "NONE"
+
+                stop_afk_camera()
+
+                last_activity =
+                    "Plugin disabled"
+
+            else
+
+                afk_status =
+                    "DISABLED"
+
+            end
+
+        else
+
+            afk_status =
+                "ACTIVE"
+
+            last_activity =
+                "Plugin enabled"
+
+        end
+
+        logMsg(
+            "AFK CAMERA: "
+            .. (
+                afk_enabled
+                and "ENABLED"
+                or "DISABLED"
+            )
+        )
+
+    end
+
+
+    imgui.TextUnformatted("")
+
+
+    -- --------------------------------------------------------
+    -- AFK TIMER
+    -- --------------------------------------------------------
+
+    imgui.TextUnformatted(
+        "AFK Timer"
+    )
+
+    local timeout_changed, new_timeout =
+        imgui.SliderFloat(
+            "Seconds of inactivity",
+            AFK_TIMEOUT,
+            AFK_TIMEOUT_MIN,
+            AFK_TIMEOUT_MAX,
+            "%.0f s"
+        )
+
+    if timeout_changed then
+
+        AFK_TIMEOUT =
+            clamp_afk_timeout(
+                new_timeout
+            )
+
+    end
+
+
+    imgui.TextUnformatted(
+        "Current timer: "
+        .. string.format(
+            "%.0f",
+            AFK_TIMEOUT
+        )
+        .. " seconds"
+    )
+
+
+    imgui.Separator()
+
+
+    -- --------------------------------------------------------
+    -- CURRENT STATE
+    -- --------------------------------------------------------
+
+    imgui.TextUnformatted(
+        "Status: "
+        .. (
+            afk_enabled
+            and (
+                afk_active
+                and "AFK"
+                or "ACTIVE"
+            )
+            or "DISABLED"
+        )
+    )
+
+    imgui.TextUnformatted(
+        "Last activity: "
+        .. tostring(
+            last_activity
+        )
+    )
+
+
+    imgui.TextUnformatted("")
+
+
+    -- --------------------------------------------------------
+    -- SAVE
+    -- --------------------------------------------------------
+
+    if imgui.Button(
+        "Save Settings",
+        150,
+        32
+    ) then
+
+        if save_afk_settings() then
+
+            afk_settings_save_message =
+                "Settings saved."
+
+            afk_settings_save_message_time =
+                os.clock()
+
+        else
+
+            afk_settings_save_message =
+                "Could not save settings."
+
+            afk_settings_save_message_time =
+                os.clock()
+
+        end
+
+    end
+
+
+    imgui.SameLine()
+
+
+    if imgui.Button(
+        "Restore Defaults",
+        150,
+        32
+    ) then
+
+        restore_afk_defaults()
+
+        -- Make the reset persistent immediately, so the restored
+        -- values become the settings loaded on the next X-Plane run.
+        if save_afk_settings() then
+
+            afk_settings_save_message =
+                "Defaults restored and saved."
+
+        else
+
+            afk_settings_save_message =
+                "Defaults restored, but could not save."
+
+        end
+
+        afk_settings_save_message_time =
+            os.clock()
+
+    end
+
+
+    imgui.SameLine()
+
+
+    if imgui.Button(
+        "Close",
+        100,
+        32
+    ) then
+
+        afk_settings_hide_wnd()
+
+    end
+
+
+    if afk_settings_save_message ~= ""
+       and (
+            os.clock()
+            - afk_settings_save_message_time
+       ) < 3.0 then
+
+        imgui.TextUnformatted(
+            afk_settings_save_message
+        )
+
+    end
+
+end
+
+
+-- ============================================================
+-- FLYWITHLUA SHUTDOWN / RELOAD CLEANUP
+-- ============================================================
+--
+-- IMPORTANT:
+-- FlyWithLua stores do_on_exit() as Lua code text and executes it
+-- during script shutdown/reload. Local variables are not directly
+-- visible to that code text.
+--
+-- Therefore the actual cleanup lives in this GLOBAL function.
+-- Because this function is a closure, it still has access to the
+-- script's local callback handles/state when FlyWithLua executes it.
+--
+-- This is especially important for:
+--   * XPLM key sniffer callback
+--   * XPLM external camera callback
+--   * floating settings window callbacks
+--
+-- Leaving one of those native callbacks registered against an
+-- unloaded Lua state can make the next keyboard/view event jump
+-- into invalid memory and crash X-Plane.
+
+function afk_camera_shutdown_cleanup()
+
+    logMsg(
+        "AFK CAMERA: SHUTDOWN / RELOAD CLEANUP START"
+    )
+
+
+    -- --------------------------------------------------------
+    -- Close the settings window before the Lua state disappears.
+    -- --------------------------------------------------------
+
+    if afk_settings_wnd then
+
+        float_wnd_destroy(
+            afk_settings_wnd
+        )
+
+        afk_settings_wnd =
+            nil
+
+    end
+
+
+    -- --------------------------------------------------------
+    -- Release external XPLM camera ownership.
+    -- --------------------------------------------------------
+
+    if external_camera_controlled then
+
+        external_camera_controlled =
+            false
+
+        external_camera_ownership_lost =
+            false
+
+        -- We still own the camera here, therefore releasing it is
+        -- valid and prevents the old FFI camera callback from being
+        -- called after the Lua state is torn down.
+        XPLM.XPLMDontControlCamera()
+
+    else
+
+        external_camera_ownership_lost =
+            false
+
+    end
+
+
+    -- --------------------------------------------------------
+    -- Restore the pilot-head pose used by the normal X-Plane
+    -- cockpit camera.
+    -- --------------------------------------------------------
+
+    if cockpit_camera_controlled then
+
+        set(
+            "sim/graphics/view/pilots_head_x",
+            cockpit_base_head_x
+        )
+
+        set(
+            "sim/graphics/view/pilots_head_y",
+            cockpit_base_head_y
+        )
+
+        set(
+            "sim/graphics/view/pilots_head_z",
+            cockpit_base_head_z
+        )
+
+        set(
+            "sim/graphics/view/pilots_head_psi",
+            cockpit_base_head_psi
+        )
+
+        set(
+            "sim/graphics/view/pilots_head_the",
+            cockpit_base_head_the
+        )
+
+        set(
+            "sim/graphics/view/pilots_head_phi",
+            cockpit_base_head_phi
+        )
+
+        cockpit_camera_controlled =
+            false
+
+    end
+
+
+    -- --------------------------------------------------------
+    -- Unregister the native keyboard sniffer.
+    -- --------------------------------------------------------
+
+    if keyboard_sniffer_result == 1 then
+
+        XPLM.XPLMUnregisterKeySniffer(
+            keyboard_callback,
+            0,
+            nil
+        )
+
+        keyboard_sniffer_result =
+            0
+
+    end
+
+
+    afk_active =
+        false
+
+    afk_entry_view_type =
+        nil
+
+    logMsg(
+        "AFK CAMERA: SHUTDOWN / RELOAD CLEANUP COMPLETE"
+    )
+
+end
+
+
+do_on_exit(
+    "afk_camera_shutdown_cleanup()"
+)
+
+-- Use a one-shot macro for opening the settings window.
+-- This keeps the FlyWithLua menu item from remaining checked
+-- after the window is closed with its X button.
+add_macro(
+    "AFK Camera: Open Settings",
+    "afk_settings_show_wnd()"
+)
+
+
+create_command(
+    "AFKCamera/settings_toggle",
+    "Open/close AFK Camera settings",
+    "afk_settings_toggle_wnd()",
     "",
     ""
 )
@@ -2881,6 +3665,41 @@ create_command(
 
 function afk_director_update()
 
+    -- Complete plugin disable: release AFK camera ownership,
+    -- clear AFK state and do not accumulate idle time.
+    if not afk_enabled then
+
+        if afk_active
+           or cockpit_camera_controlled
+           or external_camera_controlled then
+
+            afk_active =
+                false
+
+            afk_status =
+                "DISABLED"
+
+            current_shot =
+                "NONE"
+
+            afk_entry_view_type =
+                nil
+
+            external_camera_ownership_lost =
+                false
+
+            stop_afk_camera()
+
+        end
+
+        idle_time =
+            0.0
+
+        return
+
+    end
+
+
     poll_mouse_buttons()
 
     poll_mouse_yoke_input()
@@ -2889,7 +3708,89 @@ function afk_director_update()
 
     poll_joystick_input()
 
-    update_director_mode()
+
+    -- --------------------------------------------------------
+    -- VIEW CHANGE / CAMERA OWNERSHIP SAFETY
+    -- --------------------------------------------------------
+    --
+    -- Exterior:
+    -- X-Plane tells the camera callback when it takes ownership
+    -- back after a manual view change. The callback only records
+    -- the event; all Lua state changes happen here.
+    if external_camera_ownership_lost then
+
+        external_camera_ownership_lost =
+            false
+
+        if afk_active then
+
+            afk_active =
+                false
+
+            afk_status =
+                "ACTIVE"
+
+            current_shot =
+                "NONE"
+
+            idle_time =
+                0.0
+
+            afk_entry_view_type =
+                nil
+
+            last_activity =
+                "View changed"
+
+            logMsg(
+                "AFK CAMERA: EXITED AFK MODE - "
+                .. "VIEW CHANGED / CAMERA RETURNED TO X-PLANE"
+            )
+
+        end
+
+    end
+
+
+    -- When AFK is not active, capture the current user view so
+    -- the correct director is selected when AFK eventually starts.
+    if not afk_active then
+
+        update_director_mode()
+
+    elseif director_mode == "COCKPIT"
+       and afk_entry_view_type ~= nil
+       and afk_view_type ~= afk_entry_view_type then
+
+        -- Cockpit AFK never owns XPLM camera control, so detect
+        -- a manual view transition here and restore the original
+        -- pilot-head pose before returning to normal flight.
+        afk_active =
+            false
+
+        afk_status =
+            "ACTIVE"
+
+        current_shot =
+            "NONE"
+
+        idle_time =
+            0.0
+
+        last_activity =
+            "View changed"
+
+        afk_entry_view_type =
+            nil
+
+        stop_cockpit_camera()
+
+        logMsg(
+            "AFK CAMERA: EXITED AFK MODE - "
+            .. "COCKPIT VIEW CHANGED"
+        )
+
+    end
 
 
     -- --------------------------------------------------------
@@ -2973,12 +3874,14 @@ function afk_director_update()
 
             current_shot = "NONE"
 
+            afk_entry_view_type = nil
+
 
             stop_afk_camera()
 
 
             logMsg(
-                "AFK DIRECTOR: "
+                "AFK CAMERA: "
                 .. "EXITED AFK MODE - MOUSE INPUT"
             )
 
@@ -3109,7 +4012,7 @@ function afk_debug_display()
     draw_string(
         30,
         700,
-        "AFK DIRECTOR"
+        "AFK CAMERA"
     )
 
 
@@ -3246,7 +4149,7 @@ function afk_debug_display()
     or external_camera_controlled then
 
         camera_owner =
-            "AFK Director"
+            "AFK Camera"
 
     end
 
@@ -3290,7 +4193,7 @@ function handle_keyboard_activity()
         stop_afk_camera()
 
         logMsg(
-            "AFK DIRECTOR: EXITED AFK MODE - KEYBOARD INPUT"
+            "AFK CAMERA: EXITED AFK MODE - KEYBOARD INPUT"
         )
 
     end
@@ -3337,13 +4240,38 @@ logMsg(
 )
 
 logMsg(
-    "AFK DIRECTOR PHASE 5"
+    "AFK CAMERA PHASE 5"
 )
 
 logMsg(
     "AFK timeout: "
     .. AFK_TIMEOUT
     .. " seconds"
+)
+
+logMsg(
+    "AFK Camera enabled: "
+    .. tostring(
+        afk_enabled
+    )
+)
+
+logMsg(
+    "Default settings: Enabled="
+    .. tostring(
+        DEFAULT_AFK_ENABLED
+    )
+    .. " | Timeout="
+    .. string.format(
+        "%.0f",
+        DEFAULT_AFK_TIMEOUT
+    )
+    .. " s"
+)
+
+logMsg(
+    "Settings file: "
+    .. AFK_SETTINGS_FILE
 )
 
 logMsg(
@@ -3365,7 +4293,7 @@ logMsg(
 )
 
 logMsg(
-    "AFK camera owner: AFK Director"
+    "AFK camera owner: AFK Camera"
 )
 
 logMsg(
