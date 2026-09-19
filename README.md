@@ -80,15 +80,15 @@ Open the settings window from:
 
 The UI currently provides:
 
-| Setting | Range / Behavior |
-|---|---|
-| Enable AFK Camera | Enable / disable |
-| AFK Timer | 3 to 300 seconds |
-| Mouse movement ends AFK | On / off |
-| Joystick dead zone | 0.1% to 25% |
-| Show Debug HUD | On / off |
-| Save Settings | Writes settings to disk |
-| Restore Defaults | Restores the configured defaults and saves them |
+| Setting                 | Range / Behavior                                |
+| ----------------------- | ----------------------------------------------- |
+| Enable AFK Camera       | Enable / disable                                |
+| AFK Timer               | 3 to 300 seconds                                |
+| Mouse movement ends AFK | On / off                                        |
+| Joystick dead zone      | 0.1% to 25%                                     |
+| Show Debug HUD          | On / off                                        |
+| Save Settings           | Writes settings to disk                         |
+| Restore Defaults        | Restores the configured defaults and saves them |
 
 ### Default values
 
@@ -151,6 +151,7 @@ You do **not** need to edit this file manually. The settings UI is the recommend
 The current script was developed around **FlyWithLua NG+ 2.8.16**.
 
 FlyWithLua:
+
 - https://forums.x-plane.org/files/file/82888-flywithlua-ng-next-generation-plus-edition-for-x-plane-12-win-lin-mac/
 
 ### Optional
@@ -162,8 +163,8 @@ AFK Camera can detect Better Mouse Yoke activity so mouse-yoke control can wake 
 AFK Camera does **not** enable or disable Better Mouse Yoke itself.
 
 Better Mouse Yoke project:
-- https://github.com/smiley22/XPPlugins
-- https://github.com/smiley22/XPPlugins/releases
+
+- https://forums.x-plane.org/files/file/51810-bettermouseyoke/
 
 ---
 
@@ -278,13 +279,13 @@ The external camera:
 
 AFK Camera recognizes these X-Plane view types:
 
-| View | AFK behavior |
-|---|---|
-| Cockpit | Cockpit pilot-head director |
-| External Circle | External cinematic camera |
-| Free Cam | External cinematic camera |
-| Runway | External cinematic camera |
-| Still Spot | External cinematic camera |
+| View            | AFK behavior                     |
+| --------------- | -------------------------------- |
+| Cockpit         | Cockpit pilot-head director      |
+| External Circle | External cinematic camera        |
+| Free Cam        | External cinematic camera        |
+| Runway          | External cinematic camera        |
+| Still Spot      | External cinematic camera        |
 | Other / unknown | AFK state without camera control |
 
 ---
@@ -412,7 +413,7 @@ Built for the X-Plane 12 community with FlyWithLua.
 Third-party projects used / supported by the setup:
 
 - FlyWithLua - https://forums.x-plane.org/files/file/82888-flywithlua-ng-next-generation-plus-edition-for-x-plane-12-win-lin-mac/
-- Better Mouse Yoke - https://github.com/smiley22/XPPlugins
+- Better Mouse Yoke - https://forums.x-plane.org/files/file/51810-bettermouseyoke/
 
 ---
 
