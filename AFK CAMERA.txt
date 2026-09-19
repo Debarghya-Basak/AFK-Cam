@@ -1,7 +1,6 @@
 -- ============================================================
 -- AFK CAMERA
--- Phase 6 - menu added and bug fixes
--- MADE BY DEBARGHYA BASAK
+-- Phase 5 - FFI Cockpit Camera Control
 -- ============================================================
 
 
