@@ -4,6 +4,8 @@
 
 AFK Camera automatically turns an unattended aircraft into a cinematic scene. After a configurable period of inactivity, it can direct the **cockpit pilot head** or run a sequence of **external cinematic camera shots**, then return control when the pilot interacts again.
 
+[**Download AFK CAMERA ZIP (v1.0)**](https://github.com/Debarghya-Basak/AFK-Cam/archive/refs/tags/v1.0.zip)
+
 Built for **X-Plane 12 + FlyWithLua NG+**.
 
 ---
