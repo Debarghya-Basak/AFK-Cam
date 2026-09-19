@@ -23,7 +23,23 @@
 -- AFK timeout is in seconds.
 
 local DEFAULT_AFK_ENABLED = true
-local DEFAULT_AFK_TIMEOUT = 3.0
+local DEFAULT_AFK_TIMEOUT = 30.0
+
+-- Debug HUD (the on-screen status text drawn every frame).
+--   true  = shown
+--   false = hidden
+local DEFAULT_AFK_DEBUG_HUD = true
+
+-- Mouse movement (cursor moving, no button) counts as activity.
+--   true  = moving the mouse resets the timer / ends AFK
+--   false = only clicks, wheel and the mouse-yoke modes count
+local DEFAULT_AFK_MOUSE_MOVE_RETURN = true
+
+-- Joystick dead zone, in percent of full axis travel. Axis
+-- changes smaller than this between two frames are ignored, so
+-- the idle jitter of cheap sticks does not end AFK. Raise it if
+-- the HUD shows "Joystick ..." activity while nothing is touched.
+local DEFAULT_AFK_JOYSTICK_DEADZONE = 1.0
 
 
 local AFK_TIMEOUT = DEFAULT_AFK_TIMEOUT
@@ -46,8 +62,18 @@ local AFK_SETTINGS_FILE =
 
 local afk_enabled = true
 
+local afk_debug_hud_visible = DEFAULT_AFK_DEBUG_HUD
+
+local afk_mouse_move_return = DEFAULT_AFK_MOUSE_MOVE_RETURN
+
+-- Percent. Divide by 100 before comparing with raw axis values.
+local afk_joystick_deadzone = DEFAULT_AFK_JOYSTICK_DEADZONE
+
 local AFK_TIMEOUT_MIN = 3.0
 local AFK_TIMEOUT_MAX = 300.0
+
+local AFK_JOYSTICK_DEADZONE_MIN = 0.1
+local AFK_JOYSTICK_DEADZONE_MAX = 25.0
 
 
 function clamp_afk_timeout(value)
@@ -65,6 +91,28 @@ function clamp_afk_timeout(value)
 
     if v > AFK_TIMEOUT_MAX then
         v = AFK_TIMEOUT_MAX
+    end
+
+    return v
+
+end
+
+
+function clamp_afk_joystick_deadzone(value)
+
+    local v =
+        tonumber(value)
+
+    if v == nil then
+        return DEFAULT_AFK_JOYSTICK_DEADZONE
+    end
+
+    if v < AFK_JOYSTICK_DEADZONE_MIN then
+        v = AFK_JOYSTICK_DEADZONE_MIN
+    end
+
+    if v > AFK_JOYSTICK_DEADZONE_MAX then
+        v = AFK_JOYSTICK_DEADZONE_MAX
     end
 
     return v
@@ -114,6 +162,33 @@ function load_afk_settings()
                         value
                     )
 
+            elseif key == "debug_hud" then
+
+                local normalized =
+                    value:lower()
+
+                afk_debug_hud_visible =
+                    normalized == "1"
+                    or normalized == "true"
+                    or normalized == "yes"
+
+            elseif key == "mouse_move" then
+
+                local normalized =
+                    value:lower()
+
+                afk_mouse_move_return =
+                    normalized == "1"
+                    or normalized == "true"
+                    or normalized == "yes"
+
+            elseif key == "joystick_deadzone" then
+
+                afk_joystick_deadzone =
+                    clamp_afk_joystick_deadzone(
+                        value
+                    )
+
             end
 
         end
@@ -133,6 +208,17 @@ function restore_afk_defaults()
     AFK_TIMEOUT =
         clamp_afk_timeout(
             DEFAULT_AFK_TIMEOUT
+        )
+
+    afk_debug_hud_visible =
+        DEFAULT_AFK_DEBUG_HUD
+
+    afk_mouse_move_return =
+        DEFAULT_AFK_MOUSE_MOVE_RETURN
+
+    afk_joystick_deadzone =
+        clamp_afk_joystick_deadzone(
+            DEFAULT_AFK_JOYSTICK_DEADZONE
         )
 
     idle_time =
@@ -170,6 +256,20 @@ function restore_afk_defaults()
             AFK_TIMEOUT
         )
         .. " s"
+        .. " | DebugHUD="
+        .. tostring(
+            afk_debug_hud_visible
+        )
+        .. " | MouseMove="
+        .. tostring(
+            afk_mouse_move_return
+        )
+        .. " | JoystickDeadzone="
+        .. string.format(
+            "%.1f",
+            afk_joystick_deadzone
+        )
+        .. " %"
     )
 
 end
@@ -211,6 +311,27 @@ function save_afk_settings()
         "\n"
     )
 
+    file:write(
+        "debug_hud=",
+        afk_debug_hud_visible and "1" or "0",
+        "\n"
+    )
+
+    file:write(
+        "mouse_move=",
+        afk_mouse_move_return and "1" or "0",
+        "\n"
+    )
+
+    file:write(
+        "joystick_deadzone=",
+        string.format(
+            "%.1f",
+            afk_joystick_deadzone
+        ),
+        "\n"
+    )
+
     file:close()
 
 
@@ -224,6 +345,20 @@ function save_afk_settings()
             AFK_TIMEOUT
         )
         .. " s"
+        .. " | DebugHUD="
+        .. tostring(
+            afk_debug_hud_visible
+        )
+        .. " | MouseMove="
+        .. tostring(
+            afk_mouse_move_return
+        )
+        .. " | JoystickDeadzone="
+        .. string.format(
+            "%.1f",
+            afk_joystick_deadzone
+        )
+        .. " %"
     )
 
     return true
@@ -805,6 +940,138 @@ function handle_right_mouse_activity()
 end
 
 
+-- ============================================================
+-- WINDOWS MOUSE MOVEMENT DETECTION
+-- ============================================================
+--
+-- Plain cursor movement with no button held. Optional, because
+-- some users prefer that only deliberate input (click, wheel,
+-- stick) ends AFK. The baseline is refreshed every frame even
+-- while the option is off, so enabling it mid-flight can never
+-- fire on a stale delta.
+
+-- Cursor must move at least this many pixels between frames.
+local MOUSE_MOVE_THRESHOLD_PX =
+    2
+
+local mouse_move_point =
+    ffi.new("AFK_POINT[1]")
+
+local mouse_move_previous_x =
+    nil
+
+local mouse_move_previous_y =
+    nil
+
+local mouse_move_input_detected =
+    false
+
+
+function poll_mouse_movement()
+
+    if user32.GetCursorPos(mouse_move_point) == 0 then
+        return
+    end
+
+    local x =
+        tonumber(
+            mouse_move_point[0].x
+        ) or 0
+
+    local y =
+        tonumber(
+            mouse_move_point[0].y
+        ) or 0
+
+
+    if mouse_move_previous_x == nil then
+
+        mouse_move_previous_x =
+            x
+
+        mouse_move_previous_y =
+            y
+
+        return
+
+    end
+
+
+    local dx =
+        math.abs(
+            x
+            - mouse_move_previous_x
+        )
+
+    local dy =
+        math.abs(
+            y
+            - mouse_move_previous_y
+        )
+
+    mouse_move_previous_x =
+        x
+
+    mouse_move_previous_y =
+        y
+
+
+    if not afk_mouse_move_return then
+        return
+    end
+
+    if dx >= MOUSE_MOVE_THRESHOLD_PX
+    or dy >= MOUSE_MOVE_THRESHOLD_PX then
+
+        mouse_move_input_detected =
+            true
+
+    end
+
+end
+
+
+function handle_mouse_move_activity()
+
+    if not mouse_move_input_detected then
+        return false
+    end
+
+    mouse_move_input_detected =
+        false
+
+    idle_time =
+        0.0
+
+    last_activity =
+        "Mouse movement"
+
+    if afk_active then
+
+        afk_active =
+            false
+
+        afk_status =
+            "ACTIVE"
+
+        current_shot =
+            "NONE"
+
+        stop_afk_camera()
+
+        logMsg(
+            "AFK CAMERA: "
+            .. "EXITED AFK MODE - "
+            .. "MOUSE MOVEMENT"
+        )
+
+    end
+
+    return true
+
+end
+
+
 
 -- ============================================================
 -- X-PLANE MOUSE JOYSTICK INPUT
@@ -1278,10 +1545,11 @@ initialise_better_mouse_yoke_values()
 -- frame to the next. Aircraft attitude cannot change these
 -- raw joystick values.
 --
--- Axis assignments:
---   1 = Pitch
---   2 = Roll
---   3 = Yaw
+-- EVERY axis is watched, whatever X-Plane has it assigned to
+-- (pitch, roll, yaw, throttle, prop, mixture, brakes, sliders,
+-- even unassigned). Moving anything on any connected device is
+-- player activity. The assignment is only used to label the
+-- activity in the HUD.
 --
 -- Buttons are treated as activity while physically held.
 
@@ -1307,8 +1575,44 @@ local JOYSTICK_AXIS_COUNT =
 local JOYSTICK_BUTTON_COUNT =
     3200
 
-local JOYSTICK_AXIS_CHANGE_THRESHOLD =
-    0.01
+-- The change threshold is the user's dead zone setting
+-- (afk_joystick_deadzone, percent) converted to a 0..1 fraction
+-- at poll time.
+
+-- Largest frame-to-frame axis change seen on the last poll,
+-- as a 0..1 fraction. Shown in the settings window so a user
+-- can read off their stick's idle jitter and set the dead zone
+-- just above it.
+local joystick_last_max_difference =
+    0.0
+
+-- X-Plane axis assignment codes -> HUD label. Anything not
+-- listed is still detected; it is simply reported generically.
+local JOYSTICK_AXIS_NAMES = {
+    [1] = "Joystick Pitch",
+    [2] = "Joystick Roll",
+    [3] = "Joystick Yaw",
+    [4] = "Joystick Throttle",
+    [5] = "Joystick Collective",
+    [6] = "Joystick Left Brake",
+    [7] = "Joystick Right Brake",
+    [8] = "Joystick Prop",
+    [9] = "Joystick Mixture"
+}
+
+
+function get_joystick_axis_name(assignment)
+
+    local name =
+        JOYSTICK_AXIS_NAMES[assignment]
+
+    if name == nil then
+        return "Joystick Axis"
+    end
+
+    return name
+
+end
 
 
 local joystick_previous_axis_values = {}
@@ -1371,85 +1675,83 @@ function poll_joystick_input()
 
 
     -- --------------------------------------------------------
-    -- Pitch / Roll / Yaw axis movement
+    -- Any axis movement
     -- --------------------------------------------------------
+    --
+    -- Every axis baseline is updated every frame, even after a
+    -- change has been found, so a second axis moving at the same
+    -- time is not reported again next frame with a stale baseline.
+
+    local axis_detected =
+        false
+
+    local axis_threshold =
+        afk_joystick_deadzone
+        / 100.0
+
+    local frame_max_difference =
+        0.0
 
     for i = 0, JOYSTICK_AXIS_COUNT - 1 do
 
-        local assignment =
+        local current_value =
             tonumber(
-                joystick_axis_assignments[i]
+                joystick_axis_values[i]
             )
 
-        if assignment == 1
-        or assignment == 2
-        or assignment == 3 then
-
-            local current_value =
-                tonumber(
-                    joystick_axis_values[i]
-                )
+        if current_value ~= nil then
 
             local previous_value =
                 joystick_previous_axis_values[i]
 
-            if current_value ~= nil then
+            joystick_previous_axis_values[i] =
+                current_value
 
-                if previous_value == nil then
+            if previous_value ~= nil then
 
-                    joystick_previous_axis_values[i] =
+                local difference =
+                    math.abs(
                         current_value
+                        - previous_value
+                    )
 
-                else
+                if difference > frame_max_difference then
 
-                    local difference =
-                        math.abs(
-                            current_value
-                            - previous_value
+                    frame_max_difference =
+                        difference
+
+                end
+
+                if not axis_detected
+                and difference > axis_threshold then
+
+                    axis_detected =
+                        true
+
+                    joystick_input_type =
+                        get_joystick_axis_name(
+                            tonumber(
+                                joystick_axis_assignments[i]
+                            )
                         )
-
-
-                    if difference >
-                        JOYSTICK_AXIS_CHANGE_THRESHOLD then
-
-                        joystick_input_detected =
-                            true
-
-
-                        if assignment == 1 then
-
-                            joystick_input_type =
-                                "Joystick Pitch"
-
-                        elseif assignment == 2 then
-
-                            joystick_input_type =
-                                "Joystick Roll"
-
-                        else
-
-                            joystick_input_type =
-                                "Joystick Yaw"
-
-                        end
-
-
-                        joystick_previous_axis_values[i] =
-                            current_value
-
-                        return
-
-                    end
-
-
-                    joystick_previous_axis_values[i] =
-                        current_value
 
                 end
 
             end
 
         end
+
+    end
+
+    joystick_last_max_difference =
+        frame_max_difference
+
+    if axis_detected then
+
+        joystick_input_detected =
+            true
+
+        return
 
     end
 
@@ -1576,6 +1878,30 @@ local cockpit_camera_offset_z = 0.0
 
 
 local cockpit_last_callback_time = os.clock()
+
+
+-- ------------------------------------------------------------
+-- RETURN TO PRE-AFK VIEW
+-- ------------------------------------------------------------
+--
+-- When cockpit AFK ends, the pilot head is driven back to the
+-- exact pose captured at AFK entry over this many seconds, using
+-- the same per-frame writes as the director itself. A single
+-- one-frame write is not enough: X-Plane and other camera
+-- add-ons can write the head in the same frame.
+--
+-- 0 = snap back instantly.
+local COCKPIT_RETURN_TIME = 0.75
+
+local cockpit_return_active = false
+local cockpit_return_time = 0.0
+
+local cockpit_return_start_heading = 0.0
+local cockpit_return_start_pitch = 0.0
+
+-- Last head heading/pitch the director actually wrote.
+local cockpit_current_heading = 0.0
+local cockpit_current_pitch = 0.0
 
 
 -- ============================================================
@@ -2397,37 +2723,153 @@ end
         -- Using set() here makes the write unambiguous while the
         -- normal cockpit camera remains under X-Plane/XPRealistic.
 
-        set(
-            "sim/graphics/view/pilots_head_x",
-            cockpit_base_head_x
-        )
-
-        set(
-            "sim/graphics/view/pilots_head_y",
-            cockpit_base_head_y
-        )
-
-        set(
-            "sim/graphics/view/pilots_head_z",
-            cockpit_base_head_z
-        )
-
-        set(
-            "sim/graphics/view/pilots_head_psi",
-            heading
-        )
-
-        set(
-            "sim/graphics/view/pilots_head_the",
+        cockpit_write_head_pose(
+            heading,
             pitch
         )
 
-        -- Preserve the pilot's existing head roll. Aircraft bank
-        -- remains under X-Plane's normal cockpit camera.
-        set(
-            "sim/graphics/view/pilots_head_phi",
-            cockpit_base_head_phi
+        cockpit_current_heading =
+            heading
+
+        cockpit_current_pitch =
+            pitch
+
+end
+
+
+-- ============================================================
+-- PILOT HEAD WRITER
+-- ============================================================
+--
+-- Position and roll always come from the pose captured at AFK
+-- entry; only heading/pitch are animated. Aircraft bank remains
+-- under X-Plane's normal cockpit camera.
+
+function cockpit_write_head_pose(heading, pitch)
+
+    set(
+        "sim/graphics/view/pilots_head_x",
+        cockpit_base_head_x
+    )
+
+    set(
+        "sim/graphics/view/pilots_head_y",
+        cockpit_base_head_y
+    )
+
+    set(
+        "sim/graphics/view/pilots_head_z",
+        cockpit_base_head_z
+    )
+
+    set(
+        "sim/graphics/view/pilots_head_psi",
+        heading
+    )
+
+    set(
+        "sim/graphics/view/pilots_head_the",
+        pitch
+    )
+
+    set(
+        "sim/graphics/view/pilots_head_phi",
+        cockpit_base_head_phi
+    )
+
+end
+
+
+-- Put the head exactly where it was when AFK started and end
+-- any return animation.
+function cockpit_restore_head_pose()
+
+    cockpit_write_head_pose(
+        cockpit_base_head_psi,
+        cockpit_base_head_the
+    )
+
+    cockpit_current_heading =
+        cockpit_base_head_psi
+
+    cockpit_current_pitch =
+        cockpit_base_head_the
+
+    cockpit_return_active =
+        false
+
+    cockpit_return_time =
+        0.0
+
+end
+
+
+-- Runs every frame from the main loop, whether or not AFK is
+-- active, until the head is back at the pre-AFK pose.
+function cockpit_return_update(delta_time)
+
+    if not cockpit_return_active then
+        return
+    end
+
+    -- The user left the cockpit view: no point animating.
+    if afk_view_type ~= 1026 then
+
+        cockpit_restore_head_pose()
+
+        return
+
+    end
+
+    cockpit_return_time =
+        cockpit_return_time
+        + delta_time
+
+    local progress =
+        cockpit_return_time
+        / COCKPIT_RETURN_TIME
+
+    if progress >= 1.0 then
+
+        cockpit_restore_head_pose()
+
+        logMsg(
+            "AFK CAMERA: COCKPIT VIEW RETURNED TO PRE-AFK POSE"
         )
+
+        return
+
+    end
+
+    local smooth_progress =
+        cockpit_smoothstep(progress)
+
+    local heading =
+        cockpit_return_start_heading
+        + (
+            cockpit_base_head_psi
+            - cockpit_return_start_heading
+        )
+        * smooth_progress
+
+    local pitch =
+        cockpit_return_start_pitch
+        + (
+            cockpit_base_head_the
+            - cockpit_return_start_pitch
+        )
+        * smooth_progress
+
+    cockpit_write_head_pose(
+        heading,
+        pitch
+    )
+
+    cockpit_current_heading =
+        heading
+
+    cockpit_current_pitch =
+        pitch
 
 end
 
@@ -2442,24 +2884,45 @@ function start_cockpit_camera()
         return
     end
 
-    -- Capture the exact normal X-Plane pilot-head pose.
-    cockpit_base_head_x =
-        tonumber(afk_pilot_head_x) or 0.0
+    if cockpit_return_active then
 
-    cockpit_base_head_y =
-        tonumber(afk_pilot_head_y) or 0.0
+        -- Still animating back from the previous AFK session.
+        -- The head is not at the user's pose yet, so keep the
+        -- base captured last time instead of re-capturing.
+        cockpit_return_active =
+            false
 
-    cockpit_base_head_z =
-        tonumber(afk_pilot_head_z) or 0.0
+        cockpit_return_time =
+            0.0
 
-    cockpit_base_head_psi =
-        tonumber(afk_pilot_head_psi) or 0.0
+    else
 
-    cockpit_base_head_the =
-        tonumber(afk_pilot_head_the) or 0.0
+        -- Capture the exact normal X-Plane pilot-head pose.
+        cockpit_base_head_x =
+            tonumber(afk_pilot_head_x) or 0.0
 
-    cockpit_base_head_phi =
-        tonumber(afk_pilot_head_phi) or 0.0
+        cockpit_base_head_y =
+            tonumber(afk_pilot_head_y) or 0.0
+
+        cockpit_base_head_z =
+            tonumber(afk_pilot_head_z) or 0.0
+
+        cockpit_base_head_psi =
+            tonumber(afk_pilot_head_psi) or 0.0
+
+        cockpit_base_head_the =
+            tonumber(afk_pilot_head_the) or 0.0
+
+        cockpit_base_head_phi =
+            tonumber(afk_pilot_head_phi) or 0.0
+
+    end
+
+    cockpit_current_heading =
+        cockpit_base_head_psi
+
+    cockpit_current_pitch =
+        cockpit_base_head_the
 
 
     cockpit_camera_controlled = true
@@ -2508,30 +2971,24 @@ end
 -- STOP COCKPIT CAMERA
 -- ============================================================
 
-function stop_cockpit_camera()
+-- immediate = true snaps the head back this frame (plugin
+-- disabled, view changed, script unloading). Otherwise the head
+-- glides back over COCKPIT_RETURN_TIME.
+function stop_cockpit_camera(immediate)
 
     if not cockpit_camera_controlled then
+
+        -- Not directing, but possibly still gliding back.
+        if immediate
+        and cockpit_return_active then
+
+            cockpit_restore_head_pose()
+
+        end
+
         return
+
     end
-
-    -- Restore the exact pilot-head pose from before AFK.
-    afk_pilot_head_x =
-        cockpit_base_head_x
-
-    afk_pilot_head_y =
-        cockpit_base_head_y
-
-    afk_pilot_head_z =
-        cockpit_base_head_z
-
-    afk_pilot_head_psi =
-        cockpit_base_head_psi
-
-    afk_pilot_head_the =
-        cockpit_base_head_the
-
-    afk_pilot_head_phi =
-        cockpit_base_head_phi
 
 
     cockpit_camera_controlled = false
@@ -2539,10 +2996,42 @@ function stop_cockpit_camera()
 
     -- No XPLMDontControlCamera() call here because cockpit AFK
     -- never took control of the X-Plane camera.
+
+    if immediate
+    or COCKPIT_RETURN_TIME <= 0
+    or afk_view_type ~= 1026 then
+
+        cockpit_restore_head_pose()
+
+        logMsg(
+            "AFK CAMERA: "
+            .. "COCKPIT DIRECTOR STOPPED - "
+            .. "VIEW RESTORED TO PRE-AFK POSE"
+        )
+
+        return
+
+    end
+
+
+    cockpit_return_active =
+        true
+
+    cockpit_return_time =
+        0.0
+
+    cockpit_return_start_heading =
+        cockpit_current_heading
+
+    cockpit_return_start_pitch =
+        cockpit_current_pitch
+
     logMsg(
         "AFK CAMERA: "
         .. "COCKPIT DIRECTOR STOPPED - "
-        .. "X-PLANE / XPREALISTIC CAMERA UNTOUCHED"
+        .. "RETURNING TO PRE-AFK POSE OVER "
+        .. string.format("%.2f", COCKPIT_RETURN_TIME)
+        .. " S"
     )
 
 end
@@ -2584,9 +3073,9 @@ end
 -- UNIFIED AFK CAMERA RELEASE
 -- ============================================================
 
-function stop_afk_camera()
+function stop_afk_camera(immediate)
 
-    stop_cockpit_camera()
+    stop_cockpit_camera(immediate)
     stop_external_circle_camera()
 
 end
@@ -3184,7 +3673,7 @@ function afk_settings_show_wnd()
     afk_settings_wnd =
         float_wnd_create(
             460,
-            330,
+            500,
             1,
             true
         )
@@ -3369,6 +3858,96 @@ function afk_settings_on_build(wnd, x, y)
         )
         .. " seconds"
     )
+
+
+    imgui.TextUnformatted("")
+
+
+    -- --------------------------------------------------------
+    -- WAKE-UP INPUTS
+    -- --------------------------------------------------------
+
+    imgui.TextUnformatted(
+        "Wake-up inputs"
+    )
+
+    local mouse_move_changed, new_mouse_move =
+        imgui.Checkbox(
+            "Mouse movement ends AFK",
+            afk_mouse_move_return
+        )
+
+    if mouse_move_changed then
+
+        afk_mouse_move_return =
+            new_mouse_move
+
+        logMsg(
+            "AFK CAMERA: MOUSE MOVEMENT WAKE-UP "
+            .. (
+                afk_mouse_move_return
+                and "ENABLED"
+                or "DISABLED"
+            )
+        )
+
+    end
+
+    local deadzone_changed, new_deadzone =
+        imgui.SliderFloat(
+            "Joystick dead zone",
+            afk_joystick_deadzone,
+            AFK_JOYSTICK_DEADZONE_MIN,
+            AFK_JOYSTICK_DEADZONE_MAX,
+            "%.1f %%"
+        )
+
+    if deadzone_changed then
+
+        afk_joystick_deadzone =
+            clamp_afk_joystick_deadzone(
+                new_deadzone
+            )
+
+    end
+
+    imgui.TextUnformatted(
+        "Axis changes below the dead zone are ignored."
+    )
+
+    -- Live jitter readout: leave the stick alone and set the
+    -- dead zone a little above the number shown here.
+    imgui.TextUnformatted(
+        "Largest axis change right now: "
+        .. string.format(
+            "%.2f",
+            joystick_last_max_difference
+            * 100.0
+        )
+        .. " %"
+    )
+
+
+    imgui.TextUnformatted("")
+
+
+    -- --------------------------------------------------------
+    -- DEBUG HUD
+    -- --------------------------------------------------------
+
+    local debug_changed, new_debug_visible =
+        imgui.Checkbox(
+            "Show Debug HUD",
+            afk_debug_hud_visible
+        )
+
+    if debug_changed then
+
+        afk_set_debug_hud_visible(
+            new_debug_visible
+        )
+
+    end
 
 
     imgui.Separator()
@@ -3568,37 +4147,10 @@ function afk_camera_shutdown_cleanup()
     -- cockpit camera.
     -- --------------------------------------------------------
 
-    if cockpit_camera_controlled then
+    if cockpit_camera_controlled
+    or cockpit_return_active then
 
-        set(
-            "sim/graphics/view/pilots_head_x",
-            cockpit_base_head_x
-        )
-
-        set(
-            "sim/graphics/view/pilots_head_y",
-            cockpit_base_head_y
-        )
-
-        set(
-            "sim/graphics/view/pilots_head_z",
-            cockpit_base_head_z
-        )
-
-        set(
-            "sim/graphics/view/pilots_head_psi",
-            cockpit_base_head_psi
-        )
-
-        set(
-            "sim/graphics/view/pilots_head_the",
-            cockpit_base_head_the
-        )
-
-        set(
-            "sim/graphics/view/pilots_head_phi",
-            cockpit_base_head_phi
-        )
+        cockpit_restore_head_pose()
 
         cockpit_camera_controlled =
             false
@@ -3671,6 +4223,7 @@ function afk_director_update()
 
         if afk_active
            or cockpit_camera_controlled
+           or cockpit_return_active
            or external_camera_controlled then
 
             afk_active =
@@ -3688,7 +4241,7 @@ function afk_director_update()
             external_camera_ownership_lost =
                 false
 
-            stop_afk_camera()
+            stop_afk_camera(true)
 
         end
 
@@ -3701,6 +4254,8 @@ function afk_director_update()
 
 
     poll_mouse_buttons()
+
+    poll_mouse_movement()
 
     poll_mouse_yoke_input()
 
@@ -3783,7 +4338,7 @@ function afk_director_update()
         afk_entry_view_type =
             nil
 
-        stop_cockpit_camera()
+        stop_cockpit_camera(true)
 
         logMsg(
             "AFK CAMERA: EXITED AFK MODE - "
@@ -3819,6 +4374,19 @@ function afk_director_update()
 
 
     -- --------------------------------------------------------
+    -- Return to pre-AFK cockpit view
+    -- --------------------------------------------------------
+    --
+    -- Must run before the activity handlers below: they return
+    -- early on every frame with input, which is exactly when the
+    -- return animation is playing.
+
+    cockpit_return_update(
+        delta_time
+    )
+
+
+    -- --------------------------------------------------------
     -- Better Mouse Yoke
     -- --------------------------------------------------------
 
@@ -3850,6 +4418,15 @@ function afk_director_update()
     -- --------------------------------------------------------
 
     if handle_right_mouse_activity() then
+        return
+    end
+
+
+    -- --------------------------------------------------------
+    -- Mouse movement (optional)
+    -- --------------------------------------------------------
+
+    if handle_mouse_move_activity() then
         return
     end
 
@@ -4007,7 +4584,46 @@ end
 -- DEBUG HUD
 -- ============================================================
 
+function afk_set_debug_hud_visible(visible)
+
+    afk_debug_hud_visible =
+        visible and true or false
+
+    logMsg(
+        "AFK CAMERA: DEBUG HUD "
+        .. (
+            afk_debug_hud_visible
+            and "SHOWN"
+            or "HIDDEN"
+        )
+    )
+
+end
+
+
+function afk_debug_hud_toggle()
+
+    afk_set_debug_hud_visible(
+        not afk_debug_hud_visible
+    )
+
+end
+
+
+create_command(
+    "AFKCamera/debug_hud_toggle",
+    "Show/hide AFK Camera debug HUD",
+    "afk_debug_hud_toggle()",
+    "",
+    ""
+)
+
+
 function afk_debug_display()
+
+    if not afk_debug_hud_visible then
+        return
+    end
 
     draw_string(
         30,
@@ -4123,6 +4739,16 @@ function afk_debug_display()
         "Current Shot: "
         .. current_shot
     )
+
+    if cockpit_return_active then
+
+        draw_string(
+            30,
+            380,
+            "Cockpit: RETURNING TO PRE-AFK VIEW"
+        )
+
+    end
 
     if external_camera_controlled then
 
@@ -4254,6 +4880,29 @@ logMsg(
     .. tostring(
         afk_enabled
     )
+)
+
+logMsg(
+    "Debug HUD visible: "
+    .. tostring(
+        afk_debug_hud_visible
+    )
+)
+
+logMsg(
+    "Mouse movement wake-up: "
+    .. tostring(
+        afk_mouse_move_return
+    )
+)
+
+logMsg(
+    "Joystick dead zone: "
+    .. string.format(
+        "%.1f",
+        afk_joystick_deadzone
+    )
+    .. " %"
 )
 
 logMsg(
