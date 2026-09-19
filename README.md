@@ -149,7 +149,7 @@ You do **not** need to edit this file manually. The settings UI is the recommend
 The current script was developed around **FlyWithLua NG+ 2.8.16**.
 
 FlyWithLua:
-- https://github.com/X-Friese/FlyWithLua
+- https://forums.x-plane.org/files/file/82888-flywithlua-ng-next-generation-plus-edition-for-x-plane-12-win-lin-mac/
 
 ### Optional
 
@@ -409,7 +409,7 @@ Built for the X-Plane 12 community with FlyWithLua.
 
 Third-party projects used / supported by the setup:
 
-- FlyWithLua - https://github.com/X-Friese/FlyWithLua
+- FlyWithLua - https://forums.x-plane.org/files/file/82888-flywithlua-ng-next-generation-plus-edition-for-x-plane-12-win-lin-mac/
 - Better Mouse Yoke - https://github.com/smiley22/XPPlugins
 
 ---
