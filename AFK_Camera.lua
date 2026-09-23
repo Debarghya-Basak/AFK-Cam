@@ -28,7 +28,7 @@ local DEFAULT_AFK_TIMEOUT = 30.0
 -- Debug HUD (the on-screen status text drawn every frame).
 --   true  = shown
 --   false = hidden
-local DEFAULT_AFK_DEBUG_HUD = true
+local DEFAULT_AFK_DEBUG_HUD = false
 
 -- Cockpit head movement, as a percentage of the built-in
 -- motion. 100 is the tuned default.
@@ -49,7 +49,7 @@ local DEFAULT_AFK_AUTO_ENTRY = true
 -- Mouse movement (cursor moving, no button) counts as activity.
 --   true  = moving the mouse resets the timer / ends AFK
 --   false = only clicks, wheel and the mouse-yoke modes count
-local DEFAULT_AFK_MOUSE_MOVE_RETURN = true
+local DEFAULT_AFK_MOUSE_MOVE_RETURN = false
 
 -- Joystick dead zone, in percent of full axis travel. Axis
 -- changes smaller than this between two frames are ignored, so
