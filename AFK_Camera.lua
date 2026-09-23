@@ -1391,6 +1391,14 @@ local XPLM = ffi.load("XPLM_64")
 ffi.cdef[[
 typedef void *XPLMCommandRef;
 
+typedef int XPLMCommandPhase;
+
+typedef int (*XPLMCommandCallback_f)(
+    XPLMCommandRef inCommand,
+    XPLMCommandPhase inPhase,
+    void *inRefcon
+);
+
 XPLMCommandRef XPLMFindCommand(
     const char *inName
 );
@@ -1398,7 +1406,43 @@ XPLMCommandRef XPLMFindCommand(
 void XPLMCommandOnce(
     XPLMCommandRef inCommand
 );
+
+void XPLMRegisterCommandHandler(
+    XPLMCommandRef inCommand,
+    XPLMCommandCallback_f inHandler,
+    int inBefore,
+    void *inRefcon
+);
+
+void XPLMUnregisterCommandHandler(
+    XPLMCommandRef inCommand,
+    XPLMCommandCallback_f inHandler,
+    int inBefore,
+    void *inRefcon
+);
 ]]
+
+-- Every view command we successfully hook, so shutdown can
+-- unregister exactly what was registered. Leaving a handler
+-- attached to a torn-down Lua state crashes X-Plane on the next
+-- press, the same hazard the key sniffer has.
+--
+-- These are declared here, well above the shutdown cleanup that
+-- reads them. Declared next to the registration further down
+-- they would be out of scope there, and the cleanup would
+-- silently read nil globals instead.
+local afk_view_command_refs = {}
+
+local afk_view_command_callback
+
+-- True only while this script is issuing a view command itself.
+--
+-- The exterior director starts by firing sim/view/circle, which
+-- is one of the commands hooked below. Without this flag the
+-- handler sees AFK active, assumes the user just changed view,
+-- and cancels AFK in the same breath that started it.
+local afk_view_command_internal = false
+
 
 local external_circle_command =
     XPLM.XPLMFindCommand(
@@ -5272,9 +5316,17 @@ function start_external_circle_camera()
         return
     end
 
+    -- XPLMCommandOnce dispatches synchronously, so the hooked
+    -- handler runs and returns inside this call.
+    afk_view_command_internal =
+        true
+
     XPLM.XPLMCommandOnce(
         external_circle_command
     )
+
+    afk_view_command_internal =
+        false
 
     external_camera_ownership_lost =
         false
@@ -6063,6 +6115,28 @@ function afk_camera_shutdown_cleanup()
     end
 
 
+    -- --------------------------------------------------------
+    -- Unregister the view command handlers.
+    -- --------------------------------------------------------
+    --
+    -- Same hazard as the key sniffer: a handler still attached
+    -- to an unloaded Lua state turns the next view keypress
+    -- into a jump through invalid memory.
+
+    for i = 1, #afk_view_command_refs do
+
+        XPLM.XPLMUnregisterCommandHandler(
+            afk_view_command_refs[i],
+            afk_view_command_callback,
+            1,
+            nil
+        )
+
+    end
+
+    afk_view_command_refs = {}
+
+
     afk_active =
         false
 
@@ -6281,6 +6355,154 @@ create_command(
     "afk_manual_trigger()",
     "",
     ""
+)
+
+
+-- ============================================================
+-- LEAVING AFK BY CHANGING VIEW
+-- ============================================================
+--
+-- The cockpit director works by displacing the pilot's head.
+-- X-Plane treats a displaced head as a view the user has panned
+-- away from, so the first press of a view key is spent
+-- recentring it and only the second actually changes view.
+--
+-- Watching for the keypress is too late to help: the key
+-- sniffer only sets a flag, which the frame loop reads after
+-- X-Plane has already dealt with the command, by which point
+-- the first press is gone.
+--
+-- Registering on the view commands themselves with inBefore
+-- set fixes it properly. The handler runs BEFORE X-Plane acts,
+-- puts the head straight back where the user left it, and
+-- returns 1 so the command carries on as normal. X-Plane then
+-- sees a centred head and changes view on the first press.
+--
+-- It also makes view changes end AFK the same way whatever
+-- they came from, since a keyboard key, a HOTAS button and a
+-- menu click all arrive here as the same command.
+
+local AFK_VIEW_COMMANDS = {
+    "sim/view/forward_with_hud",
+    "sim/view/forward_with_2d_panel",
+    "sim/view/forward_with_nothing",
+    "sim/view/forward_with_panel",
+    "sim/view/3d_cockpit_cmnd_look",
+    "sim/view/default_view",
+    "sim/view/chase",
+    "sim/view/circle",
+    "sim/view/still_spot",
+    "sim/view/linear_spot",
+    "sim/view/runway",
+    "sim/view/tower",
+    "sim/view/ridealong",
+    "sim/view/track_weapon",
+    "sim/view/free_camera",
+    "sim/view/quick_look_0",
+    "sim/view/quick_look_1",
+    "sim/view/quick_look_2",
+    "sim/view/quick_look_3",
+    "sim/view/quick_look_4",
+    "sim/view/quick_look_5",
+    "sim/view/quick_look_6",
+    "sim/view/quick_look_7",
+    "sim/view/quick_look_8",
+    "sim/view/quick_look_9"
+}
+
+function afk_exit_for_view_command()
+
+    -- Our own sim/view/circle, not the user changing view.
+    if afk_view_command_internal then
+        return
+    end
+
+    if not afk_active then
+        return
+    end
+
+    afk_active =
+        false
+
+    afk_status =
+        "ACTIVE"
+
+    current_shot =
+        "NONE"
+
+    afk_entry_view_type =
+        nil
+
+    idle_time =
+        0.0
+
+    last_activity =
+        "View changed"
+
+    -- Snap rather than glide. X-Plane is about to act on this
+    -- command and has to see the head already centred, so there
+    -- is no time for the usual return animation.
+    stop_cockpit_camera(true)
+
+    -- The exterior camera is deliberately not released here.
+    -- Giving up camera ownership belongs in the frame loop and
+    -- in X-Plane's own losing-control callback, which fires as
+    -- soon as the view actually changes.
+
+    logMsg(
+        "AFK CAMERA: EXITED AFK MODE - VIEW COMMAND"
+    )
+
+end
+
+
+afk_view_command_callback = ffi.cast(
+    "XPLMCommandCallback_f",
+    function(command, phase, refcon)
+
+        -- Phase 0 is the press. Ignore the hold and the release.
+        if phase == 0 then
+            afk_exit_for_view_command()
+        end
+
+        -- 1 lets the command continue to X-Plane.
+        return 1
+
+    end
+)
+
+
+for i = 1, #AFK_VIEW_COMMANDS do
+
+    local command_ref =
+        XPLM.XPLMFindCommand(
+            AFK_VIEW_COMMANDS[i]
+        )
+
+    -- Not every command exists in every X-Plane build, and
+    -- XPLMFindCommand simply returns null for the ones that do
+    -- not. Those are skipped rather than treated as an error.
+    if command_ref ~= nil then
+
+        XPLM.XPLMRegisterCommandHandler(
+            command_ref,
+            afk_view_command_callback,
+            1,
+            nil
+        )
+
+        afk_view_command_refs[#afk_view_command_refs + 1] =
+            command_ref
+
+    end
+
+end
+
+logMsg(
+    "AFK CAMERA: VIEW COMMANDS HOOKED: "
+    .. tostring(#afk_view_command_refs)
+    .. " / "
+    .. tostring(#AFK_VIEW_COMMANDS)
 )
 
 
