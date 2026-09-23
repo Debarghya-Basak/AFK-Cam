@@ -30,6 +30,11 @@ local DEFAULT_AFK_TIMEOUT = 30.0
 --   false = hidden
 local DEFAULT_AFK_DEBUG_HUD = true
 
+-- How AFK starts.
+--   true  = automatic, when the idle timer runs out
+--   false = manual only, when the bound key/button is pressed
+local DEFAULT_AFK_AUTO_ENTRY = true
+
 -- Mouse movement (cursor moving, no button) counts as activity.
 --   true  = moving the mouse resets the timer / ends AFK
 --   false = only clicks, wheel and the mouse-yoke modes count
@@ -63,6 +68,8 @@ local AFK_SETTINGS_FILE =
 local afk_enabled = true
 
 local afk_debug_hud_visible = DEFAULT_AFK_DEBUG_HUD
+
+local afk_auto_entry = DEFAULT_AFK_AUTO_ENTRY
 
 local afk_mouse_move_return = DEFAULT_AFK_MOUSE_MOVE_RETURN
 
@@ -172,6 +179,16 @@ function load_afk_settings()
                     or normalized == "true"
                     or normalized == "yes"
 
+            elseif key == "auto_entry" then
+
+                local normalized =
+                    value:lower()
+
+                afk_auto_entry =
+                    normalized == "1"
+                    or normalized == "true"
+                    or normalized == "yes"
+
             elseif key == "mouse_move" then
 
                 local normalized =
@@ -212,6 +229,9 @@ function restore_afk_defaults()
 
     afk_debug_hud_visible =
         DEFAULT_AFK_DEBUG_HUD
+
+    afk_auto_entry =
+        DEFAULT_AFK_AUTO_ENTRY
 
     afk_mouse_move_return =
         DEFAULT_AFK_MOUSE_MOVE_RETURN
@@ -259,6 +279,10 @@ function restore_afk_defaults()
         .. " | DebugHUD="
         .. tostring(
             afk_debug_hud_visible
+        )
+        .. " | AutoEntry="
+        .. tostring(
+            afk_auto_entry
         )
         .. " | MouseMove="
         .. tostring(
@@ -318,6 +342,12 @@ function save_afk_settings()
     )
 
     file:write(
+        "auto_entry=",
+        afk_auto_entry and "1" or "0",
+        "\n"
+    )
+
+    file:write(
         "mouse_move=",
         afk_mouse_move_return and "1" or "0",
         "\n"
@@ -348,6 +378,10 @@ function save_afk_settings()
         .. " | DebugHUD="
         .. tostring(
             afk_debug_hud_visible
+        )
+        .. " | AutoEntry="
+        .. tostring(
+            afk_auto_entry
         )
         .. " | MouseMove="
         .. tostring(
@@ -576,6 +610,37 @@ local director_mode = "NONE"
 local current_shot = "NONE"
 
 local mouse_input_detected = false
+
+
+-- ------------------------------------------------------------
+-- MANUAL TRIGGER INPUT GRACE
+-- ------------------------------------------------------------
+--
+-- The control that starts AFK is itself input. A joystick
+-- button bound to the trigger fires the command AND registers
+-- as joystick activity, which would end AFK on the very next
+-- frame. The same is true of a keyboard key or a mouse button.
+--
+-- So after a manual trigger, input is swallowed for a short
+-- window instead of being treated as a wake-up. The window
+-- extends while the control is still held, so holding the
+-- button does not immediately cancel AFK, and it is hard
+-- capped so a control left pressed cannot wedge AFK on.
+
+local AFK_MANUAL_GRACE = 1.0
+local AFK_MANUAL_GRACE_TAIL = 0.4
+local AFK_MANUAL_GRACE_MAX = 5.0
+
+local afk_input_grace_until = 0.0
+local afk_input_grace_limit = 0.0
+
+-- Set by the bound command, acted on by the frame loop. The
+-- command fires from X-Plane's command dispatch, and entering
+-- AFK takes camera ownership, so the request is recorded here
+-- and carried out from the normal flight loop instead. This is
+-- the same rule the exterior camera already follows when
+-- X-Plane hands ownership back.
+local afk_manual_request = false
 
 
 -- ============================================================
@@ -2132,44 +2197,6 @@ dataref(
     "afk_plane_heading",
     "sim/flightmodel/position/psi"
 )
-
-
--- ============================================================
--- PLAYER ACTIVITY
--- ============================================================
-
-function player_activity(activity)
-
-    idle_time = 0.0
-
-    last_activity = activity
-
-
-    if afk_active then
-
-        afk_active = false
-
-        afk_status = "ACTIVE"
-
-        current_shot = "NONE"
-
-        afk_entry_view_type = nil
-
-
-        -- Release camera control ONLY if AFK Camera currently
-        -- owns the camera. This hands ownership back to X-Plane,
-        -- allowing XPRealistic to resume its camera effects.
-        stop_afk_camera()
-
-
-        logMsg(
-            "AFK CAMERA: EXIT - "
-            .. activity
-        )
-
-    end
-
-end
 
 
 -- ============================================================
@@ -4136,28 +4163,6 @@ end
 
 
 -- ============================================================
--- TEST COMMAND
--- ============================================================
-
-function afk_test_command()
-
-    player_activity(
-        "Test Command"
-    )
-
-end
-
-
-create_command(
-    "AFKDirector/test_activity",
-    "AFK Camera Test Activity",
-    "afk_test_command()",
-    "",
-    ""
-)
-
-
--- ============================================================
 -- SETTINGS UI
 -- ============================================================
 
@@ -4200,8 +4205,8 @@ function afk_settings_show_wnd()
 
     afk_settings_wnd =
         float_wnd_create(
-            460,
-            500,
+            470,
+            640,
             1,
             true
         )
@@ -4352,6 +4357,79 @@ function afk_settings_on_build(wnd, x, y)
 
 
     -- --------------------------------------------------------
+    -- HOW AFK STARTS
+    -- --------------------------------------------------------
+
+    imgui.TextUnformatted(
+        "AFK entry"
+    )
+
+    local auto_changed, new_auto_entry =
+        imgui.Checkbox(
+            "Automatic (idle timer)",
+            afk_auto_entry
+        )
+
+    if auto_changed then
+
+        afk_auto_entry =
+            new_auto_entry
+
+        idle_time =
+            0.0
+
+        logMsg(
+            "AFK CAMERA: AFK ENTRY SET TO "
+            .. (
+                afk_auto_entry
+                and "AUTOMATIC"
+                or "MANUAL"
+            )
+        )
+
+    end
+
+    if afk_auto_entry then
+
+        imgui.TextUnformatted(
+            "AFK starts on its own when the timer runs out."
+        )
+
+    else
+
+        imgui.TextUnformatted(
+            "AFK starts only when you press the bound control."
+        )
+
+    end
+
+    imgui.TextUnformatted("")
+
+    imgui.TextUnformatted(
+        "Bind any key, mouse or joystick button to:"
+    )
+
+    imgui.TextUnformatted(
+        "    AFK Camera: start/stop AFK now"
+    )
+
+    imgui.TextUnformatted(
+        "X-Plane > Settings > Keyboard or Joystick,"
+    )
+
+    imgui.TextUnformatted(
+        "then search for AFK. The same control stops AFK."
+    )
+
+    imgui.TextUnformatted(
+        "It works in automatic mode too, as a shortcut."
+    )
+
+
+    imgui.TextUnformatted("")
+
+
+    -- --------------------------------------------------------
     -- AFK TIMER
     -- --------------------------------------------------------
 
@@ -4378,14 +4456,24 @@ function afk_settings_on_build(wnd, x, y)
     end
 
 
-    imgui.TextUnformatted(
-        "Current timer: "
-        .. string.format(
-            "%.0f",
-            AFK_TIMEOUT
+    if afk_auto_entry then
+
+        imgui.TextUnformatted(
+            "Current timer: "
+            .. string.format(
+                "%.0f",
+                AFK_TIMEOUT
+            )
+            .. " seconds"
         )
-        .. " seconds"
-    )
+
+    else
+
+        imgui.TextUnformatted(
+            "Not used while AFK entry is manual."
+        )
+
+    end
 
 
     imgui.TextUnformatted("")
@@ -4740,6 +4828,192 @@ create_command(
 
 
 -- ============================================================
+-- MANUAL TRIGGER
+-- ============================================================
+
+function afk_begin_input_grace()
+
+    local now =
+        os.clock()
+
+    afk_input_grace_until =
+        now + AFK_MANUAL_GRACE
+
+    afk_input_grace_limit =
+        now + AFK_MANUAL_GRACE_MAX
+
+end
+
+
+function afk_input_grace_active()
+
+    if afk_input_grace_until <= 0.0 then
+        return false
+    end
+
+    local now =
+        os.clock()
+
+    -- os.clock() can be stepped backwards by the OS. Treat that
+    -- as the window having expired rather than leaving AFK
+    -- stuck ignoring input.
+    if now >= afk_input_grace_until
+    or now >= afk_input_grace_limit
+    or now < afk_input_grace_limit - AFK_MANUAL_GRACE_MAX then
+
+        afk_input_grace_until =
+            0.0
+
+        return false
+
+    end
+
+    return true
+
+end
+
+
+-- Swallow one frame of input. Every handler tests its own flag
+-- first, so clearing the flags makes the whole activity chain
+-- fall through without any of them firing.
+function afk_clear_input_flags()
+
+    local any_input =
+        keyboard_input_detected
+        or mouse_input_detected
+        or right_mouse_input_detected
+        or mouse_move_input_detected
+        or mouse_yoke_input_detected
+        or better_mouse_yoke_input_detected
+        or joystick_input_detected
+
+    keyboard_input_detected = false
+    mouse_input_detected = false
+    right_mouse_input_detected = false
+    mouse_move_input_detected = false
+    mouse_yoke_input_detected = false
+    better_mouse_yoke_input_detected = false
+    joystick_input_detected = false
+
+
+    -- Still held: push the window out so releasing the control
+    -- does not read as a fresh wake-up.
+    if any_input then
+
+        local extended =
+            os.clock()
+            + AFK_MANUAL_GRACE_TAIL
+
+        if extended > afk_input_grace_limit then
+            extended = afk_input_grace_limit
+        end
+
+        if extended > afk_input_grace_until then
+
+            afk_input_grace_until =
+                extended
+
+        end
+
+    end
+
+end
+
+
+-- Bind this command to any key, mouse button, joystick button
+-- or controller button in X-Plane's own settings. It toggles,
+-- so the same control starts and stops AFK.
+--
+-- This only records the request. See afk_process_manual_request.
+function afk_manual_trigger()
+
+    afk_manual_request =
+        true
+
+end
+
+
+function afk_process_manual_request()
+
+    if not afk_manual_request then
+        return
+    end
+
+    afk_manual_request =
+        false
+
+
+    if not afk_enabled then
+
+        logMsg(
+            "AFK CAMERA: MANUAL TRIGGER IGNORED - "
+            .. "PLUGIN DISABLED"
+        )
+
+        return
+
+    end
+
+
+    if afk_active then
+
+        afk_active =
+            false
+
+        afk_status =
+            "ACTIVE"
+
+        current_shot =
+            "NONE"
+
+        afk_entry_view_type =
+            nil
+
+        idle_time =
+            0.0
+
+        last_activity =
+            "Manual trigger"
+
+        afk_input_grace_until =
+            0.0
+
+        stop_afk_camera()
+
+        logMsg(
+            "AFK CAMERA: EXITED AFK MODE - MANUAL TRIGGER"
+        )
+
+        return
+
+    end
+
+
+    idle_time =
+        0.0
+
+    last_activity =
+        "Manual trigger"
+
+    enter_afk()
+
+    -- The control that just fired this is almost certainly
+    -- still down. Ignore it rather than instantly waking up.
+    afk_begin_input_grace()
+
+end
+
+
+create_command(
+    "AFKCamera/trigger_afk",
+    "AFK Camera: start/stop AFK now",
+    "afk_manual_trigger()",
+    "",
+    ""
+)
+
+
+-- ============================================================
 -- MAIN LOOP
 -- ============================================================
 
@@ -4915,6 +5189,33 @@ function afk_director_update()
 
 
     -- --------------------------------------------------------
+    -- Manual trigger
+    -- --------------------------------------------------------
+    --
+    -- Handled here, before the grace window is evaluated, so
+    -- that starting AFK swallows the same frame's input from
+    -- the control that started it.
+
+    afk_process_manual_request()
+
+
+    -- --------------------------------------------------------
+    -- Manual trigger grace
+    -- --------------------------------------------------------
+    --
+    -- Runs before the activity chain below. Clearing the flags
+    -- here makes every handler fall through, so the director
+    -- keeps animating instead of the bound control waking AFK
+    -- up the instant it starts it.
+
+    if afk_input_grace_active() then
+
+        afk_clear_input_flags()
+
+    end
+
+
+    -- --------------------------------------------------------
     -- Better Mouse Yoke
     -- --------------------------------------------------------
 
@@ -5051,13 +5352,22 @@ function afk_director_update()
 
     if not afk_active then
 
-        idle_time =
-            idle_time + delta_time
+        if afk_auto_entry then
 
+            idle_time =
+                idle_time + delta_time
 
-        if idle_time >= AFK_TIMEOUT then
+            if idle_time >= AFK_TIMEOUT then
 
-            enter_afk()
+                enter_afk()
+
+            end
+
+        else
+
+            -- Manual entry: the timer does not run at all.
+            idle_time =
+                0.0
 
         end
 
@@ -5168,17 +5478,29 @@ function afk_debug_display()
     )
 
 
-    draw_string(
-        30,
-        660,
-        "Idle: "
-        .. string.format(
-            "%.1f",
-            idle_time
+    if afk_auto_entry then
+
+        draw_string(
+            30,
+            660,
+            "Idle: "
+            .. string.format(
+                "%.1f",
+                idle_time
+            )
+            .. " / "
+            .. AFK_TIMEOUT
         )
-        .. " / "
-        .. AFK_TIMEOUT
-    )
+
+    else
+
+        draw_string(
+            30,
+            660,
+            "Idle: timer off (manual entry)"
+        )
+
+    end
 
 
     draw_string(
@@ -5242,6 +5564,23 @@ function afk_debug_display()
         30,
         510,
         last_activity
+    )
+
+
+    draw_string(
+        30,
+        485,
+        "Entry: "
+        .. (
+            afk_auto_entry
+            and "AUTOMATIC"
+            or "MANUAL (bound control)"
+        )
+        .. (
+            afk_input_grace_active()
+            and "  [ignoring input]"
+            or ""
+        )
     )
 
 
@@ -5414,6 +5753,15 @@ logMsg(
     "Debug HUD visible: "
     .. tostring(
         afk_debug_hud_visible
+    )
+)
+
+logMsg(
+    "AFK entry: "
+    .. (
+        afk_auto_entry
+        and "AUTOMATIC (idle timer)"
+        or "MANUAL (bind AFKCamera/trigger_afk)"
     )
 )
 
