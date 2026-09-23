@@ -536,16 +536,17 @@ local AFK_CAMERA_CONTROL_DURATION = 1
 -- Each shot slowly moves toward its target position, holds,
 -- then cuts instantly to the next shot.
 local AFK_EXTERNAL_ZOOM = 1.0
--- Height of the aircraft-attached visual center that the
--- exterior camera continuously tracks.
+-- Height of the aircraft-attached point the camera falls back
+-- to when a shot does not name its own subject.
 local AFK_EXTERNAL_TARGET_HEIGHT = 1.5
 
 -- Aircraft-size adaptive exterior camera.
 --
 -- X-Plane exposes this value as the aircraft's shadow/viewing-distance
--- size. The cinematic coordinates are authored around the SF50-sized
--- reference used while developing these shots, then scaled for larger
--- or smaller aircraft automatically.
+-- size. Every coordinate below is authored against a reference
+-- aircraft of this size and scaled to whatever is loaded, so a
+-- close-up of the gear sits proportionally close on a light
+-- single and on an airliner alike.
 local AFK_EXTERNAL_REFERENCE_SIZE = 10.0
 
 -- Prevent unusual aircraft/add-ons with extreme size values from
@@ -553,93 +554,520 @@ local AFK_EXTERNAL_REFERENCE_SIZE = 10.0
 local AFK_EXTERNAL_MIN_SCALE = 0.70
 local AFK_EXTERNAL_MAX_SCALE = 4.00
 
-local AFK_EXTERNAL_SHOT_SPEED = 3.5
--- Base camera speed. Short shots are automatically slowed so every shot lasts >10 seconds.
-local AFK_EXTERNAL_MIN_SHOT_DURATION = 11.0
+-- Every exterior move runs for exactly this long and travels
+-- at a constant speed from beginning to end. No easing, no
+-- length-derived timing: each shot gets the same ten seconds
+-- and covers its path at one steady rate.
+local AFK_EXTERIOR_SHOT_DURATION = 10.0
 
-local AFK_EXTERNAL_SHOTS = {
+-- How finely a curved path is measured to hold that constant
+-- speed. See the arc-length table in external_prepare_shot.
+local AFK_EXTERIOR_ARC_SAMPLES = 24
+
+-- ============================================================
+-- CINEMATIC CAMERA MOVE
+-- ============================================================
+--
+-- Camera float. Even a crane or drone shot is never perfectly
+-- rigid, and that tiny drift is most of what separates a camera
+-- move from a slideshow. These are metres and degrees at the
+-- reference aircraft size, scaled per shot by its own "float".
+local AFK_EXTERIOR_FLOAT_POS = 0.075
+local AFK_EXTERIOR_FLOAT_ANGLE = 0.11
+
+-- Closest the camera may get to the ground, in metres at the
+-- reference size.
+--
+-- Shots are authored relative to the aircraft, which says
+-- nothing about where the ground is. A low pass framed for
+-- cruise puts the camera underground on a taxiway, and a shot
+-- deliberately under the belly does it every time. Clamping
+-- against the real surface height keeps every shot usable at
+-- any altitude: in the air nothing is touched, and near the
+-- ground the same move flattens into a low skimming pass
+-- instead of burying itself in the tarmac.
+local AFK_EXTERIOR_GROUND_CLEARANCE = 0.60
+
+-- There is deliberately no easing here. Every move runs at one
+-- steady rate, so the time fraction is used directly. If soft
+-- starts and stops are ever wanted again, they belong on the
+-- progress value in the camera callback, not on the arc-length
+-- mapping below, which exists precisely to remove speed change.
+
+
+-- ============================================================
+-- SHOT FORMAT
+-- ============================================================
+--
+-- Coordinates are aircraft-relative, in metres at the reference
+-- size above:  X right, Y up, Z toward the tail.
+-- So the nose is negative Z and the tail is positive Z.
+--
+--   name     shown on the debug HUD
+--   from     where the camera starts
+--   to       where it ends
+--   look     the point on the aircraft it frames
+--   look_to  optional second point. Given one, the framing
+--            slides from "look" to "look_to" during the move,
+--            which is what makes a tracking pan rather than a
+--            camera staring at one spot
+--   zoom     optional {start, end}. A slow push in is the
+--            cheapest cinematic trick there is
+--   roll     optional dutch angle in degrees
+--   float    optional handheld multiplier, 0 locks the camera
+--            off entirely
+--   via      optional curve control point. Given one, the
+--            camera flies an arc through it instead of a
+--            straight line
+--
+-- Duration is not a per-shot setting: every move takes
+-- AFK_EXTERIOR_SHOT_DURATION seconds at a constant speed.
+--
+-- Anything omitted falls back to a sensible default, so a new
+-- shot can be as short as name/from/to.
+
+
+-- ============================================================
+-- PARKED SHOTS
+-- ============================================================
+--
+-- Used when the aircraft is stopped on the ground. Close, slow
+-- and detail-led: the sort of coverage a walkaround gets.
+--
+-- Part positions cannot be read from X-Plane in any way that
+-- holds across every aircraft, so these frame regions of the
+-- airframe proportionally rather than tracking named parts.
+-- On an unusual layout a shot may frame near a part rather
+-- than dead on it; the coordinates are here to be nudged.
+--
+-- FRAMING DISTANCE
+--
+-- Each shot is built from the point it frames ("look") plus a
+-- direction and a distance, rather than by placing the camera
+-- and the subject independently. Authored the loose way the
+-- two drift together and the camera ends up almost touching
+-- the aircraft.
+--
+-- Closest approach is about 60% of the aircraft's size, out to
+-- 150% for the establishing shots, so a detail shot fills the
+-- frame with the gear or the window and still shows enough of
+-- the airframe around it to read. Lens pushes are kept to 1.08
+-- at most for the same reason: zoom tightens the framing on
+-- top of the distance.
+
+local AFK_EXTERIOR_PARKED_SHOTS = {
+
+    {
+        name = "NOSE CONE",
+        from = { 5.48, 3.09, -12.47 },
+        to = { 2.86, 3.11, -10.99 },
+        look = { 0.00, 1.30, -4.30 },
+        zoom = { 1.00, 1.06 },
+    },
+
+    {
+        name = "NOSE LOW HERO",
+        from = { 5.03, 0.69, -13.53 },
+        to = { 2.28, 0.68, -11.92 },
+        look = { 0.00, 1.70, -3.80 },
+        zoom = { 1.02, 1.08 },
+        roll = -1.2,
+    },
+
+    {
+        name = "SPINNER AND NOSE",
+        from = { 1.33, 2.35, -13.56 },
+        to = { 0.42, 1.82, -11.17 },
+        look = { 0.00, 1.40, -4.20 },
+        zoom = { 1.00, 1.08 },
+    },
+
+    {
+        name = "LEFT MAIN GEAR",
+        from = { -8.12, 3.78, -3.73 },
+        to = { -7.73, 2.37, -1.27 },
+        look = { -2.00, 0.55, 1.20 },
+        float = 0.7,
+    },
+
+    {
+        name = "RIGHT MAIN GEAR",
+        from = { 8.12, 3.78, -3.73 },
+        to = { 7.73, 2.37, -1.27 },
+        look = { 2.00, 0.55, 1.20 },
+        float = 0.7,
+    },
+
+    {
+        name = "NOSE GEAR",
+        from = { 4.64, 3.65, -9.08 },
+        to = { 2.17, 2.26, -8.70 },
+        look = { 0.00, 0.45, -3.40 },
+        float = 0.7,
+    },
+
+    {
+        name = "LEFT WING TIP",
+        from = { -10.70, 4.24, 7.81 },
+        to = { -10.37, 2.94, 5.07 },
+        look = { -5.20, 1.40, 0.60 },
+        zoom = { 1.00, 1.06 },
+    },
+
+    {
+        name = "RIGHT WING TIP",
+        from = { 10.70, 4.24, 7.81 },
+        to = { 10.37, 2.94, 5.07 },
+        look = { 5.20, 1.40, 0.60 },
+        zoom = { 1.00, 1.06 },
+    },
+
+    {
+        name = "LEFT WING ROOT",
+        from = { -9.41, 5.60, -6.11 },
+        to = { -8.72, 3.56, -3.74 },
+        look = { -2.40, 1.60, -0.20 },
+    },
+
+    {
+        name = "ENGINE INTAKE",
+        from = { 9.43, 3.90, -4.76 },
+        to = { 8.41, 2.64, -2.58 },
+        look = { 2.30, 1.55, 0.20 },
+        zoom = { 1.00, 1.08 },
+    },
+
+    {
+        name = "PILOT WINDOW",
+        from = { -7.13, 5.26, -7.54 },
+        to = { -6.37, 3.89, -5.69 },
+        look = { -0.85, 2.20, -2.70 },
+        zoom = { 1.00, 1.08 },
+        float = 0.8,
+    },
+
+    {
+        name = "CABIN DOOR",
+        from = { -9.05, 4.63, -3.56 },
+        to = { -7.93, 3.29, -1.91 },
+        look = { -1.50, 1.75, 0.40 },
+    },
+
+    {
+        name = "UNDER WING",
+        from = { -7.96, 0.64, 8.42 },
+        to = { -7.68, 0.53, 5.96 },
+        look = { -3.00, 1.70, 1.60 },
+        float = 0.8,
+    },
+
+    {
+        name = "FUSELAGE TRACK",
+        from = { -9.00, 1.85, -6.00 },
+        to = { -9.00, 1.85, 6.00 },
+        look = { 0.00, 1.60, -3.60 },
+        look_to = { 0.00, 1.60, 3.60 },
+    },
+
+    {
+        name = "TAIL AND RUDDER",
+        from = { -5.27, 6.25, 14.62 },
+        to = { -2.54, 7.13, 12.60 },
+        look = { 0.00, 3.40, 5.40 },
+        zoom = { 1.00, 1.06 },
+    },
+
+    {
+        name = "TAIL LOW ANGLE",
+        from = { 4.75, 0.76, 14.38 },
+        to = { 2.07, 1.01, 12.76 },
+        look = { 0.00, 2.60, 5.20 },
+        roll = 1.4,
+    },
+
+    {
+        name = "WINGTIP TO FUSELAGE",
+        from = { 13.97, 3.85, 3.29 },
+        to = { 8.96, 4.37, -4.40 },
+        look = { 1.60, 1.60, 0.00 },
+    },
+
+    {
+        name = "REAR THREE QUARTER LOW",
+        from = { -7.85, 0.95, 12.74 },
+        to = { -5.27, 2.23, 11.46 },
+        look = { 0.00, 1.60, 2.40 },
+        roll = -1.0,
+    },
+
+    {
+        name = "HIGH THREE QUARTER",
+        from = { 10.21, 9.16, -11.83 },
+        to = { 7.82, 6.53, -11.07 },
+        look = { 0.00, 1.50, -0.60 },
+        zoom = { 1.00, 1.06 },
+    },
+
+    {
+        name = "WALKAROUND ARC",
+        from = { -13.53, 5.23, -6.56 },
+        to = { -13.75, 5.05, 6.10 },
+        look = { 0.00, 1.60, -1.20 },
+        look_to = { 0.00, 1.60, 1.20 },
+        zoom = { 1.00, 1.04 },
+    }
+
+}
+
+
+-- ============================================================
+-- FLIGHT SHOTS
+-- ============================================================
+--
+-- Used in the air, on the runway and while taxiing. These are
+-- the original framings, now with the push-ins, dutch angles,
+-- tracking pans and float that make a move read as a shot.
+
+local AFK_EXTERIOR_FLIGHT_SHOTS = {
+
     {
         name = "RIGHT REAR CLOSE",
-        start_x = 17.00, start_y = 6.80, start_z = 20.40,
-        end_x = 11.05, end_y = 5.61, end_z = 15.04
+        from = { 19.99, 6.67, 17.13 },
+        to = { 8.06, 5.48, 16.76 },
+        via = { 14.32, 6.36, 18.41 },
+        look = { 0.00, 1.50, 2.00 },
+        look_to = { 0.00, 1.50, -1.00 },
+        zoom = { 1.00, 1.08 }
     },
     {
         name = "LEFT NOSE CLOSE",
-        start_x = -17.85, start_y = 6.80, start_z = -3.40,
-        end_x = -11.90, end_y = 5.02, end_z = -7.56
+        from = { -18.18, 6.77, -0.16 },
+        to = { -10.95, 4.83, -9.62 },
+        via = { -15.38, 6.07, -5.87 },
+        look = { 0.00, 1.50, 0.00 },
+        look_to = { 0.00, 1.40, -3.00 },
+        zoom = { 1.00, 1.08 },
+        roll = { 0.0, -1.4 }
     },
     {
         name = "TOP NOSE DIAGONAL",
-        start_x = -8.50, start_y = 15.30, start_z = -12.75,
-        end_x = 2.21, end_y = 10.54, end_z = -16.32
+        from = { -7.59, 15.23, -13.49 },
+        to = { 1.32, 11.01, -16.12 },
+        via = { -3.08, 13.96, -15.96 },
+        look = { 0.00, 1.20, -2.00 },
+        zoom = { 1.00, 1.10 }
     },
     {
         name = "LOW SIDE SWEEP",
-        start_x = 17.00, start_y = 3.40, start_z = 5.95,
-        end_x = -6.20, end_y = 4.00, end_z = 1.79
+        from = { 20.28, 4.69, 3.84 },
+        to = { 11.87, 5.23, -11.16 },
+        via = { 18.51, 5.67, -5.33 },
+        look = { 0.00, 1.60, 1.00 },
+        look_to = { 0.00, 1.60, -2.00 },
+        roll = { 0.0, 2.0 },
+        float = 1.3
     },
     {
         name = "LEFT WING CLOSE",
-        start_x = -23.80, start_y = 7.65, start_z = 1.70,
-        end_x = -14.28, end_y = 7.05, end_z = 5.86
+        from = { -23.86, 7.42, -0.00 },
+        to = { -13.65, 7.04, 7.22 },
+        via = { -19.77, 7.64, 4.14 },
+        look = { -6.00, 1.80, 1.00 },
+        look_to = { 0.00, 1.60, 0.00 },
+        zoom = { 1.00, 1.10 }
     },
     {
         name = "TAIL DIAGONAL",
-        start_x = -9.35, start_y = 6.80, start_z = 24.65,
-        end_x = 3.15, end_y = 5.61, end_z = 17.51
+        from = { -8.23, 6.92, 25.12 },
+        to = { 2.16, 5.63, 17.65 },
+        via = { -2.72, 6.57, 22.68 },
+        look = { 0.00, 2.40, 5.00 },
+        look_to = { 0.00, 1.60, 0.00 },
+        zoom = { 1.00, 1.08 }
     },
     {
         name = "NOSE LOW TO HIGH",
-        start_x = 0.00, start_y = 3.40, start_z = -22.95,
-        end_x = 0.00, end_y = 10.54, end_z = -18.19
+        from = { 0.00, 4.19, -22.85 },
+        to = { 0.00, 9.93, -18.54 },
+        via = { 0.00, 7.46, -21.22 },
+        look = { 0.00, 1.40, -3.00 },
+        zoom = { 1.02, 1.12 }
     },
     {
         name = "HIGH RIGHT PASS",
-        start_x = 22.95, start_y = 16.15, start_z = 3.40,
-        end_x = 15.81, end_y = 11.98, end_z = -4.33
+        from = { 22.43, 15.34, 8.25 },
+        to = { 15.05, 11.82, -7.69 },
+        via = { 20.29, 14.70, -0.91 },
+        look = { 0.00, 1.50, 1.00 },
+        look_to = { 0.00, 1.50, -2.00 },
+        roll = { -0.5, -2.2 },
+        float = 1.2
     },
     {
         name = "RIGHT FRONT CLOSE",
-        start_x = 19.55, start_y = 5.95, start_z = -8.50,
-        end_x = 13.00, end_y = 6.54, end_z = -13.85
+        from = { 20.33, 5.23, -6.58 },
+        to = { 11.75, 6.94, -15.06 },
+        via = { 16.86, 6.56, -11.85 },
+        look = { 0.00, 1.50, -1.00 },
+        look_to = { 0.00, 1.40, -3.50 },
+        zoom = { 1.00, 1.10 }
     },
     {
         name = "LOW LEFT DIAGONAL",
-        start_x = -19.55, start_y = 2.55, start_z = 3.40,
-        end_x = -11.22, end_y = 4.93, end_z = -3.14
+        from = { -19.64, 2.98, 2.63 },
+        to = { -11.40, 4.71, -2.68 },
+        via = { -16.08, 4.32, -0.74 },
+        look = { 0.00, 1.60, 0.00 },
+        roll = { 0.5, 2.2 },
+        float = 1.2
     },
     {
         name = "OVERHEAD CLOSE",
-        start_x = 7.65, start_y = 21.25, start_z = 10.20,
-        end_x = -1.87, end_y = 15.30, end_z = -4.67
+        from = { 6.78, 21.94, 9.17 },
+        to = { -1.25, 15.48, -3.96 },
+        via = { 2.15, 20.58, 1.82 },
+        look = { 0.00, 1.00, 2.00 },
+        look_to = { 0.00, 1.00, -2.00 },
     },
     {
         name = "LEFT REAR CLOSE",
-        start_x = -16.15, start_y = 6.80, start_z = 21.25,
-        end_x = -10.20, end_y = 5.02, end_z = 14.71
+        from = { -19.30, 7.49, 17.86 },
+        to = { -7.25, 4.31, 16.40 },
+        via = { -13.44, 6.02, 18.67 },
+        look = { 0.00, 1.50, 2.00 },
+        look_to = { 0.00, 1.50, -1.00 },
+        zoom = { 1.00, 1.08 }
+    },
+    {
+        name = "WINGTIP CHASE",
+        from = { -26.48, 4.64, 11.07 },
+        to = { -17.02, 3.83, -1.13 },
+        via = { -22.82, 4.37, 4.79 },
+        look = { -8.00, 1.80, 2.00 },
+        look_to = { 0.00, 1.50, -1.00 },
+        zoom = { 1.00, 1.08 },
+        float = 1.4
+    },
+    {
+        name = "BELLY PASS",
+        from = { 4.18, -14.31, 8.52 },
+        to = { -0.08, -7.63, -5.88 },
+        via = { 1.80, -13.09, -0.07 },
+        look = { 0.00, 0.60, 2.00 },
+        look_to = { 0.00, 0.60, -3.00 },
+        roll = { -2.5, 0.5 },
+        float = 1.3
+    },
+    {
+        name = "LEAD AND LOOK BACK",
+        from = { -6.45, 4.25, -25.45 },
+        to = { 4.73, 3.09, -18.61 },
+        via = { 0.11, 3.79, -23.59 },
+        look = { 0.00, 1.60, -2.00 },
+        zoom = { 1.00, 1.10 },
+        float = 1.2
+    },
+    {
+        name = "HIGH SLOW ORBIT",
+        from = { 25.45, 12.74, 13.81 },
+        to = { 5.86, 10.63, 24.75 },
+        via = { 17.63, 13.40, 23.14 },
+        look = { 0.00, 1.50, 0.00 },
+        zoom = { 1.00, 1.06 },
+    },
+    {
+        name = "LOW NOSE RISE",
+        from = { -6.77, 2.09, -20.08 },
+        to = { -3.26, 7.00, -14.10 },
+        via = { -5.08, 4.79, -17.59 },
+        look = { 0.00, 1.50, -3.00 },
+        look_to = { 0.00, 1.50, 1.00 },
+        zoom = { 1.02, 1.12 }
+    },
+    {
+        name = "TAIL CHASE HIGH",
+        from = { 5.62, 11.98, 27.02 },
+        to = { -4.95, 6.46, 18.79 },
+        via = { -0.21, 9.49, 24.28 },
+        look = { 0.00, 2.20, 4.00 },
+        look_to = { 0.00, 1.60, -1.00 },
+        zoom = { 1.00, 1.10 }
+    },
+
+    -- Arc-led additions.
+
+    {
+        name = "LOW ORBIT LEFT",
+        from = { -21.71, 3.66, -7.88 },
+        to = { -18.27, 4.94, 10.57 },
+        via = { -23.38, 4.82, 2.01 },
+        look = { 0.00, 1.50, -1.00 },
+        look_to = { 0.00, 1.50, 1.00 },
+        roll = { 1.5, -1.5 },
+        float = 1.2,
+    },
+    {
+        name = "CRANE OVER WING",
+        from = { 12.89, 6.32, 5.18 },
+        to = { 7.24, 13.00, -3.91 },
+        via = { 11.74, 11.14, 0.76 },
+        look = { 0.00, 1.60, 1.00 },
+        look_to = { 0.00, 1.40, -2.00 },
+        zoom = { 1.00, 1.08 },
+    },
+    {
+        name = "NOSE ARC TO PROFILE",
+        from = { 8.22, 5.01, -19.48 },
+        to = { 19.89, 5.94, -6.82 },
+        via = { 16.19, 6.14, -15.55 },
+        look = { 0.00, 1.50, -2.00 },
+        look_to = { 0.00, 1.50, 0.00 },
+        roll = { -1.0, 1.0 },
+        float = 1.2,
     }
+
 }
 
+
 -- ------------------------------------------------------------
--- RANDOM NO-REPEAT EXTERNAL SHOT BAG
+-- RANDOM NO-REPEAT SHOT BAG
 -- ------------------------------------------------------------
 --
--- Each cycle contains every one of the 12 shots exactly once,
--- in a randomized order. When the bag is exhausted it is
--- reshuffled. The first shot of the new cycle is also forced
--- to differ from the final shot of the previous cycle.
+-- Each cycle plays every shot in the active library exactly
+-- once, in a random order, then reshuffles. The first shot of a
+-- new cycle is forced to differ from the last of the previous
+-- one. Switching between parked and flight coverage rebuilds
+-- the bag from the other library.
 
 local external_shot_bag = {}
 local external_shot_bag_position = 0
 local external_last_shot_index = nil
 
+-- Which library the current bag was built from.
+local external_bag_parked = nil
+
+-- The library the running shot came from.
+local external_current_library = AFK_EXTERIOR_FLIGHT_SHOTS
+
 math.randomseed(os.time())
 
-function shuffle_external_shot_bag()
+
+function external_active_library()
+
+    if afk_exterior_parked then
+        return AFK_EXTERIOR_PARKED_SHOTS
+    end
+
+    return AFK_EXTERIOR_FLIGHT_SHOTS
+
+end
+
+
+function shuffle_external_shot_bag(library)
 
     external_shot_bag = {}
 
-    for i = 1, #AFK_EXTERNAL_SHOTS do
+    for i = 1, #library do
         external_shot_bag[i] = i
     end
 
@@ -670,12 +1098,29 @@ function shuffle_external_shot_bag()
     external_shot_bag_position = 0
 end
 
-function get_next_external_shot_index()
 
-    if external_shot_bag_position >= #external_shot_bag
+-- Returns the library to use and the index within it.
+function get_next_external_shot()
+
+    local parked_now =
+        afk_exterior_parked and true or false
+
+    local library =
+        external_active_library()
+
+    if external_bag_parked ~= parked_now
+       or external_shot_bag_position >= #external_shot_bag
        or #external_shot_bag == 0 then
 
-        shuffle_external_shot_bag()
+        -- A library change starts a fresh cycle, and the
+        -- no-repeat guard does not carry across libraries.
+        if external_bag_parked ~= parked_now then
+            external_last_shot_index = nil
+        end
+
+        shuffle_external_shot_bag(library)
+
+        external_bag_parked = parked_now
     end
 
     external_shot_bag_position =
@@ -687,8 +1132,9 @@ function get_next_external_shot_index()
     external_last_shot_index =
         shot_index
 
-    return shot_index
+    return library, shot_index
 end
+
 
 local CAMERA_MOVEMENT_THRESHOLD = 0.01
 
@@ -700,10 +1146,6 @@ local CAMERA_MOVEMENT_THRESHOLD = 0.01
 local idle_time = 0.0
 
 local afk_active = false
-
-local last_heading = nil
-local last_pitch = nil
-local last_roll = nil
 
 local last_update_time = os.clock()
 
@@ -874,7 +1316,8 @@ local cockpit_noise_time = 0.0
 
 local cockpit_noise_phase = {}
 
-for i = 1, 24 do
+-- 1..18 drive the cockpit head, 19..36 the exterior float.
+for i = 1, 36 do
 
     cockpit_noise_phase[i] =
         math.random()
@@ -987,6 +1430,102 @@ dataref(
     "readonly"
 )
 
+
+-- ============================================================
+-- PARKED DETECTION
+-- ============================================================
+--
+-- Parked gets its own close, detail-led coverage; everything
+-- else (taxi, runway, air) gets the flight shots.
+--
+-- Hysteresis keeps a gust rocking the aircraft, or a creep
+-- forward against the brakes, from flipping the library back
+-- and forth mid-sequence: it takes a sustained stop to become
+-- parked, and a clearly higher speed to stop being parked.
+
+dataref(
+    "afk_ground_speed",
+    "sim/flightmodel/position/groundspeed",
+    "readonly"
+)
+
+dataref(
+    "afk_on_ground",
+    "sim/flightmodel/failures/onground_any",
+    "readonly"
+)
+
+-- Height of the aircraft above the surface, used to work out
+-- where the ground is so the camera can be kept above it.
+dataref(
+    "afk_plane_y_agl",
+    "sim/flightmodel/position/y_agl",
+    "readonly"
+)
+
+local AFK_PARKED_SPEED_ENTER = 0.5
+local AFK_PARKED_SPEED_EXIT = 1.5
+local AFK_PARKED_SETTLE_TIME = 2.0
+
+-- Global on purpose: the shot bag above is defined earlier in
+-- the file and reads this.
+afk_exterior_parked = false
+
+local afk_parked_timer = 0.0
+
+
+function afk_update_parked_state(delta_time)
+
+    local on_ground =
+        tonumber(afk_on_ground) or 0
+
+    local speed =
+        math.abs(
+            tonumber(afk_ground_speed) or 0.0
+        )
+
+
+    if on_ground ~= 1 then
+
+        afk_exterior_parked = false
+        afk_parked_timer = 0.0
+
+        return
+
+    end
+
+
+    if afk_exterior_parked then
+
+        if speed > AFK_PARKED_SPEED_EXIT then
+
+            afk_exterior_parked = false
+            afk_parked_timer = 0.0
+
+        end
+
+        return
+
+    end
+
+
+    if speed < AFK_PARKED_SPEED_ENTER then
+
+        afk_parked_timer =
+            afk_parked_timer + delta_time
+
+        if afk_parked_timer >= AFK_PARKED_SETTLE_TIME then
+            afk_exterior_parked = true
+        end
+
+    else
+
+        afk_parked_timer = 0.0
+
+    end
+
+end
+
 function get_external_aircraft_scale()
 
     local aircraft_size =
@@ -1058,6 +1597,40 @@ local external_target_z = 15.0
 
 local external_shot_distance = 0.0
 local external_shot_duration = 1.0
+
+-- Resolved once per shot so the camera callback stays cheap:
+-- no table lookups, no nil checks, no string comparisons.
+local external_look_start_x = 0.0
+local external_look_start_y = 1.5
+local external_look_start_z = 0.0
+
+local external_look_end_x = 0.0
+local external_look_end_y = 1.5
+local external_look_end_z = 0.0
+
+local external_zoom_start = 1.0
+local external_zoom_end = 1.0
+
+local external_roll_start = 0.0
+local external_roll_end = 0.0
+
+local external_shot_float = 1.0
+
+-- Cumulative distance along a curved path, sampled at
+-- AFK_EXTERIOR_ARC_SAMPLES points. Index 0 is the start.
+local external_arc_length = {}
+
+-- Optional curve control point. A straight line between two
+-- points reads as a slider on rails; an arc reads as a crane
+-- or a drone, and it is the difference between an orbit and
+-- the chord across one.
+local external_shot_curved = false
+local external_via_x = 0.0
+local external_via_y = 0.0
+local external_via_z = 0.0
+
+-- Runs continuously so the float does not jump at a cut.
+local external_noise_time = 0.0
 
 local external_aircraft_scale = 1.0
 
@@ -2170,23 +2743,6 @@ local cockpit_base_head_phi = 0.0
 -- view change while the cockpit director is active.
 local afk_entry_view_type = nil
 
--- Aircraft pose captured at AFK entry.
-local cockpit_base_plane_x = 0.0
-local cockpit_base_plane_y = 0.0
-local cockpit_base_plane_z = 0.0
-
-local cockpit_base_plane_pitch = 0.0
-local cockpit_base_plane_roll = 0.0
-local cockpit_base_plane_heading = 0.0
-
--- Camera position relative to the aircraft at AFK entry,
--- expressed in aircraft coordinates.
-local cockpit_camera_offset_x = 0.0
-local cockpit_camera_offset_y = 0.0
-local cockpit_camera_offset_z = 0.0
-
-
-local cockpit_last_callback_time = os.clock()
 
 
 -- ------------------------------------------------------------
@@ -2415,7 +2971,6 @@ local AFK_COCKPIT_LOOKS = {
         heading = { 0.0, 0.0 },
         pitch = { 0.0, 0.0 },
         weight = 14.0,
-        hold = { 2.2, 6.0 },
         no_history = true
     },
 
@@ -2432,35 +2987,30 @@ local AFK_COCKPIT_LOOKS = {
         heading = { -2.2, 2.2 },
         pitch = { -1.5, 1.2 },
         weight = 7.0,
-        hold = { 3.0, 8.0 }
     },
     {
         name = "GLANCE LEFT",
         heading = { -9.0, -4.5 },
         pitch = { -2.0, 1.2 },
         weight = 6.0,
-        hold = { 2.2, 5.5 }
     },
     {
         name = "GLANCE RIGHT",
         heading = { 4.5, 9.0 },
         pitch = { -2.0, 1.2 },
         weight = 6.0,
-        hold = { 2.2, 5.5 }
     },
     {
         name = "SMALL NOD DOWN",
         heading = { -3.0, 3.0 },
         pitch = { -6.0, -3.0 },
         weight = 5.0,
-        hold = { 2.0, 5.0 }
     },
     {
         name = "EASE UP",
         heading = { -3.0, 3.0 },
         pitch = { 2.0, 4.5 },
         weight = 4.0,
-        hold = { 2.5, 6.5 }
     },
 
     -- --------------------------------------------------------
@@ -2484,14 +3034,12 @@ local AFK_COCKPIT_LOOKS = {
         heading = { -48.0, -36.0 },
         pitch = { -4.5, 2.0 },
         weight = 1.6,
-        hold = { 2.0, 4.5 }
     },
     {
         name = "SHOULDER CHECK RIGHT",
         heading = { 36.0, 48.0 },
         pitch = { -4.5, 2.0 },
         weight = 1.6,
-        hold = { 2.0, 4.5 }
     },
     {
         name = "HORIZON SCAN",
@@ -2504,7 +3052,6 @@ local AFK_COCKPIT_LOOKS = {
         heading = { -9.0, 9.0 },
         pitch = { 8.0, 14.0 },
         weight = 2.2,
-        hold = { 2.5, 6.0 }
     },
     {
         name = "DOWN LEFT WINDOW",
@@ -2528,7 +3075,6 @@ local AFK_COCKPIT_LOOKS = {
         heading = { -7.0, 3.0 },
         pitch = { -17.0, -10.0 },
         weight = 6.0,
-        hold = { 2.5, 7.0 }
     },
     {
         name = "LOOK PANEL LEFT",
@@ -2547,7 +3093,6 @@ local AFK_COCKPIT_LOOKS = {
         heading = { -14.0, -6.0 },
         pitch = { -19.0, -13.0 },
         weight = 2.0,
-        hold = { 2.2, 5.0 }
     },
 
     -- --------------------------------------------------------
@@ -2559,21 +3104,18 @@ local AFK_COCKPIT_LOOKS = {
         heading = { -7.0, 7.0 },
         pitch = { 23.0, 33.0 },
         weight = 2.0,
-        hold = { 2.5, 7.0 }
     },
     {
         name = "OVERHEAD LEFT",
         heading = { -16.0, -7.0 },
         pitch = { 21.0, 30.0 },
         weight = 1.4,
-        hold = { 2.2, 5.5 }
     },
     {
         name = "OVERHEAD RIGHT",
         heading = { 7.0, 16.0 },
         pitch = { 21.0, 30.0 },
         weight = 1.4,
-        hold = { 2.2, 5.5 }
     },
 
     -- --------------------------------------------------------
@@ -2585,28 +3127,24 @@ local AFK_COCKPIT_LOOKS = {
         heading = { -6.0, 6.0 },
         pitch = { -36.0, -26.0 },
         weight = 2.6,
-        hold = { 2.5, 7.0 }
     },
     {
         name = "THROTTLE QUADRANT",
         heading = { -9.0, 1.0 },
         pitch = { -33.0, -24.0 },
         weight = 2.2,
-        hold = { 2.2, 5.5 }
     },
     {
         name = "PEDESTAL RADIOS",
         heading = { 2.0, 12.0 },
         pitch = { -34.0, -25.0 },
         weight = 2.0,
-        hold = { 2.5, 7.0 }
     },
     {
         name = "TRIM AND FLAPS",
         heading = { -12.0, -3.0 },
         pitch = { -38.0, -29.0 },
         weight = 1.5,
-        hold = { 2.0, 5.0 }
     }
 
 }
@@ -2736,21 +3274,6 @@ local function cockpit_deg_to_rad(value)
 end
 
 
-local function cockpit_wrap_heading(value)
-
-    while value > 180.0 do
-        value = value - 360.0
-    end
-
-    while value < -180.0 do
-        value = value + 360.0
-    end
-
-    return value
-
-end
-
-
 -- X-Plane's aircraft coordinate convention:
 -- X = right, Y = up, Z = toward the tail.
 -- This follows the documented OpenGL/aircraft-coordinate rotation order.
@@ -2817,72 +3340,6 @@ local function cockpit_aircraft_to_world(
         x_world,
         y_world,
         z_world
-
-end
-
-
-local function cockpit_world_to_aircraft(
-    x,
-    y,
-    z,
-    pitch,
-    roll,
-    heading
-)
-
-    local phi =
-        cockpit_deg_to_rad(roll)
-
-    local theta =
-        cockpit_deg_to_rad(pitch)
-
-    local psi =
-        cockpit_deg_to_rad(heading)
-
-
-    -- Inverse heading
-    local x_heading =
-        x * math.cos(psi)
-        + z * math.sin(psi)
-
-    local y_heading =
-        y
-
-    local z_heading =
-        z * math.cos(psi)
-        - x * math.sin(psi)
-
-
-    -- Inverse pitch
-    local x_pitch =
-        x_heading
-
-    local y_pitch =
-        y_heading * math.cos(theta)
-        + z_heading * math.sin(theta)
-
-    local z_pitch =
-        z_heading * math.cos(theta)
-        - y_heading * math.sin(theta)
-
-
-    -- Inverse roll
-    local x_aircraft =
-        x_pitch * math.cos(phi)
-        - y_pitch * math.sin(phi)
-
-    local y_aircraft =
-        y_pitch * math.cos(phi)
-        + x_pitch * math.sin(phi)
-
-    local z_aircraft =
-        z_pitch
-
-
-    return
-        x_aircraft,
-        y_aircraft,
-        z_aircraft
 
 end
 
@@ -4067,10 +4524,17 @@ end
 -- EXTERNAL CINEMATIC SHOT HELPERS
 -- ============================================================
 
-function external_prepare_shot(index)
+function external_prepare_shot(library, index)
 
     local shot =
-        AFK_EXTERNAL_SHOTS[index]
+        library[index]
+
+    if shot == nil then
+        return
+    end
+
+    external_current_library =
+        library
 
     external_shot_index =
         index
@@ -4082,139 +4546,257 @@ function external_prepare_shot(index)
         0.0
 
 
-    -- HARD CUT / TELEPORT:
-    -- Each shot has its own independent starting position.
-    -- The camera jumps there immediately.
-
-    external_current_x =
-        shot.start_x
-
-    external_current_y =
-        shot.start_y
-
-    external_current_z =
-        shot.start_z
-
-    external_start_x =
-        shot.start_x
-
-    external_start_y =
-        shot.start_y
-
-    external_start_z =
-        shot.start_z
-
-    external_target_x =
-        shot.end_x
-
-    external_target_y =
-        shot.end_y
-
-    external_target_z =
-        shot.end_z
-
     -- --------------------------------------------------------
     -- AIRCRAFT-SIZE SCALING
     -- --------------------------------------------------------
     --
-    -- The authored shot is multiplied around the aircraft CG.
-    -- X/Z control lateral/longitudinal distance; Y controls
-    -- camera height. Scaling all three keeps the composition
-    -- proportional for small jets, airliners and larger aircraft.
+    -- Every authored coordinate is multiplied around the
+    -- aircraft CG, so the same shot frames a light single and
+    -- an airliner the same way.
 
     external_aircraft_scale =
         get_external_aircraft_scale()
 
-    external_current_x =
-        external_current_x
-        * external_aircraft_scale
-
-    external_current_y =
-        external_current_y
-        * external_aircraft_scale
-
-    external_current_z =
-        external_current_z
-        * external_aircraft_scale
-
-    external_start_x =
-        external_start_x
-        * external_aircraft_scale
-
-    external_start_y =
-        external_start_y
-        * external_aircraft_scale
-
-    external_start_z =
-        external_start_z
-        * external_aircraft_scale
-
-    external_target_x =
-        external_target_x
-        * external_aircraft_scale
-
-    external_target_y =
-        external_target_y
-        * external_aircraft_scale
-
-    external_target_z =
-        external_target_z
-        * external_aircraft_scale
+    local scale =
+        external_aircraft_scale
 
 
-    -- Exact 3D path length -> base duration from the camera speed.
-    -- A minimum duration is then enforced so every cinematic shot
-    -- lasts more than 10 seconds.
+    -- --------------------------------------------------------
+    -- CAMERA PATH
+    -- --------------------------------------------------------
+    --
+    -- HARD CUT: the camera teleports to the start of the shot.
 
-    local dx =
-        external_target_x
-        - external_start_x
+    external_start_x = shot.from[1] * scale
+    external_start_y = shot.from[2] * scale
+    external_start_z = shot.from[3] * scale
 
-    local dy =
-        external_target_y
-        - external_start_y
+    external_target_x = shot.to[1] * scale
+    external_target_y = shot.to[2] * scale
+    external_target_z = shot.to[3] * scale
 
-    local dz =
-        external_target_z
-        - external_start_z
+    external_current_x = external_start_x
+    external_current_y = external_start_y
+    external_current_z = external_start_z
 
-    external_shot_distance =
-        math.sqrt(
-            dx * dx
-            + dy * dy
-            + dz * dz
-        )
+
+    -- --------------------------------------------------------
+    -- SUBJECT
+    -- --------------------------------------------------------
+    --
+    -- What the shot frames. Without "look" it falls back to the
+    -- old fixed point above the CG. With "look_to" the framing
+    -- slides across the airframe during the move, which is what
+    -- turns a static stare into a tracking pan.
+
+    local look =
+        shot.look
+
+    if look == nil then
+
+        external_look_start_x = 0.0
+        external_look_start_y = AFK_EXTERNAL_TARGET_HEIGHT * scale
+        external_look_start_z = 0.0
+
+    else
+
+        external_look_start_x = look[1] * scale
+        external_look_start_y = look[2] * scale
+        external_look_start_z = look[3] * scale
+
+    end
+
+    local look_to =
+        shot.look_to
+
+    if look_to == nil then
+
+        external_look_end_x = external_look_start_x
+        external_look_end_y = external_look_start_y
+        external_look_end_z = external_look_start_z
+
+    else
+
+        external_look_end_x = look_to[1] * scale
+        external_look_end_y = look_to[2] * scale
+        external_look_end_z = look_to[3] * scale
+
+    end
+
+
+    -- --------------------------------------------------------
+    -- LENS AND FRAMING
+    -- --------------------------------------------------------
+
+    if shot.zoom == nil then
+
+        external_zoom_start = AFK_EXTERNAL_ZOOM
+        external_zoom_end = AFK_EXTERNAL_ZOOM
+
+    else
+
+        external_zoom_start = shot.zoom[1]
+        external_zoom_end = shot.zoom[2]
+
+    end
+
+    -- roll takes a single angle to hold, or {start, end} to
+    -- tilt slowly across the shot.
+    if shot.roll == nil then
+
+        external_roll_start = 0.0
+        external_roll_end = 0.0
+
+    elseif type(shot.roll) == "table" then
+
+        external_roll_start = shot.roll[1]
+        external_roll_end = shot.roll[2]
+
+    else
+
+        external_roll_start = shot.roll
+        external_roll_end = shot.roll
+
+    end
+
+
+    if shot.via == nil then
+
+        external_shot_curved = false
+
+        external_via_x = 0.0
+        external_via_y = 0.0
+        external_via_z = 0.0
+
+    else
+
+        external_shot_curved = true
+
+        external_via_x = shot.via[1] * scale
+        external_via_y = shot.via[2] * scale
+        external_via_z = shot.via[3] * scale
+
+    end
+
+    if shot.float == nil then
+        external_shot_float = 1.0
+    else
+        external_shot_float = shot.float
+    end
+
+    -- --------------------------------------------------------
+    -- DURATION
+    -- --------------------------------------------------------
+    --
+    -- Every shot runs for the same fixed time.
+
+    if external_shot_curved then
+
+        -- ARC-LENGTH TABLE
+        --
+        -- A Bezier walked with an evenly increasing parameter
+        -- does not travel at an even speed: it runs quicker
+        -- through the bend and slower at the ends, by as much
+        -- as half again on a tight curve. Measuring the curve
+        -- here lets the callback ask for a distance rather than
+        -- a parameter, which is what makes the move constant
+        -- speed instead of merely constant in time.
+        local length = 0.0
+
+        external_arc_length[0] = 0.0
+
+        local px = external_start_x
+        local py = external_start_y
+        local pz = external_start_z
+
+        for step = 1, AFK_EXTERIOR_ARC_SAMPLES do
+
+            local t = step / AFK_EXTERIOR_ARC_SAMPLES
+            local inv = 1.0 - t
+
+            local wa = inv * inv
+            local wb = 2.0 * inv * t
+            local wc = t * t
+
+            local qx =
+                wa * external_start_x
+                + wb * external_via_x
+                + wc * external_target_x
+
+            local qy =
+                wa * external_start_y
+                + wb * external_via_y
+                + wc * external_target_y
+
+            local qz =
+                wa * external_start_z
+                + wb * external_via_z
+                + wc * external_target_z
+
+            local sx = qx - px
+            local sy = qy - py
+            local sz = qz - pz
+
+            length =
+                length
+                + math.sqrt(
+                    sx * sx
+                    + sy * sy
+                    + sz * sz
+                )
+
+            external_arc_length[step] = length
+
+            px = qx
+            py = qy
+            pz = qz
+
+        end
+
+        external_shot_distance = length
+
+    else
+
+        local dx = external_target_x - external_start_x
+        local dy = external_target_y - external_start_y
+        local dz = external_target_z - external_start_z
+
+        external_shot_distance =
+            math.sqrt(
+                dx * dx
+                + dy * dy
+                + dz * dz
+            )
+
+    end
 
     if external_shot_distance < 0.01 then
-        external_shot_distance =
-            0.01
+        external_shot_distance = 0.01
     end
 
     external_shot_duration =
-        external_shot_distance
-        / AFK_EXTERNAL_SHOT_SPEED
+        AFK_EXTERIOR_SHOT_DURATION
 
-    if external_shot_duration <= AFK_EXTERNAL_MIN_SHOT_DURATION then
-        external_shot_duration =
-            AFK_EXTERNAL_MIN_SHOT_DURATION
-    end
 
     current_shot =
         shot.name
 
     logMsg(
-        "AFK CAMERA: CUT TO EXTERNAL SHOT "
+        "AFK CAMERA: CUT TO "
+        .. (
+            afk_exterior_parked
+            and "PARKED"
+            or "FLIGHT"
+        )
+        .. " SHOT "
         .. tostring(index)
         .. "/"
-        .. tostring(#AFK_EXTERNAL_SHOTS)
+        .. tostring(#library)
         .. " | "
         .. shot.name
         .. " | "
-        .. tostring(AFK_EXTERNAL_SHOT_SPEED)
-        .. " M/S BASE | MIN "
-        .. tostring(AFK_EXTERNAL_MIN_SHOT_DURATION)
-        .. " S / SLOW CLOSE"
-        .. " | SIZE SCALE "
+        .. string.format("%.1f", external_shot_duration)
+        .. " S | SIZE SCALE "
         .. string.format("%.2f", external_aircraft_scale)
     )
 
@@ -4224,10 +4806,14 @@ end
 function external_advance_shot()
 
     -- Select the next shot from the randomized no-repeat bag.
-    local next_index =
-        get_next_external_shot_index()
+    -- The library is re-checked here, so an aircraft that
+    -- starts rolling during AFK moves to flight coverage at the
+    -- next cut instead of mid-shot.
+    local library, next_index =
+        get_next_external_shot()
 
     external_prepare_shot(
+        library,
         next_index
     )
 
@@ -4290,34 +4876,105 @@ external_camera_callback = ffi.cast(
 
 
         -- ----------------------------------------------------
-        -- CONSTANT-SPEED MOVE
+        -- CAMERA MOVE
         -- ----------------------------------------------------
-        --
-        -- Linear progress gives one constant physical velocity.
-        -- There is no easing and no hold phase.
 
         external_shot_time =
             external_shot_time
             + delta_time
 
-        local progress =
+        external_noise_time =
+            external_noise_time
+            + delta_time
+
+        local raw_progress =
             external_shot_time
             / external_shot_duration
 
 
-        if progress >= 1.0 then
+        if raw_progress >= 1.0 then
 
-            external_current_x =
-                external_target_x
-
-            external_current_y =
-                external_target_y
-
-            external_current_z =
-                external_target_z
+            external_current_x = external_target_x
+            external_current_y = external_target_y
+            external_current_z = external_target_z
 
             -- Immediately prepare the next cut.
             external_advance_shot()
+
+            raw_progress = 0.0
+
+        end
+
+
+        -- Constant speed: the fraction of the shot elapsed is
+        -- used directly, with no easing applied to it.
+        local progress =
+            raw_progress
+
+        if external_shot_curved then
+
+            -- Ask the arc-length table where along the curve
+            -- this much distance falls, rather than feeding the
+            -- time fraction straight into the Bezier. Without
+            -- this the camera accelerates through the bend.
+            local curve_t =
+                progress
+
+            if external_shot_distance > 0.0001 then
+
+                local wanted =
+                    progress
+                    * external_shot_distance
+
+                local index = 1
+
+                while index < AFK_EXTERIOR_ARC_SAMPLES
+                and external_arc_length[index] < wanted do
+                    index = index + 1
+                end
+
+                local behind =
+                    external_arc_length[index - 1]
+
+                local segment =
+                    external_arc_length[index]
+                    - behind
+
+                local within = 0.0
+
+                if segment > 0.0 then
+                    within =
+                        (wanted - behind)
+                        / segment
+                end
+
+                curve_t =
+                    ((index - 1) + within)
+                    / AFK_EXTERIOR_ARC_SAMPLES
+
+            end
+
+            -- Quadratic Bezier through the control point.
+            local inv = 1.0 - curve_t
+
+            local wa = inv * inv
+            local wb = 2.0 * inv * curve_t
+            local wc = curve_t * curve_t
+
+            external_current_x =
+                wa * external_start_x
+                + wb * external_via_x
+                + wc * external_target_x
+
+            external_current_y =
+                wa * external_start_y
+                + wb * external_via_y
+                + wc * external_target_y
+
+            external_current_z =
+                wa * external_start_z
+                + wb * external_via_z
+                + wc * external_target_z
 
         else
 
@@ -4326,24 +4983,60 @@ external_camera_callback = ffi.cast(
                 + (
                     external_target_x
                     - external_start_x
-                )
-                * progress
+                ) * progress
 
             external_current_y =
                 external_start_y
                 + (
                     external_target_y
                     - external_start_y
-                )
-                * progress
+                ) * progress
 
             external_current_z =
                 external_start_z
                 + (
                     external_target_z
                     - external_start_z
-                )
-                * progress
+                ) * progress
+
+        end
+
+
+        -- ----------------------------------------------------
+        -- CAMERA FLOAT
+        -- ----------------------------------------------------
+        --
+        -- A slow, aperiodic drift on the camera body. Nothing
+        -- here is meant to be noticed on its own; it is what
+        -- stops a move looking like it is on rails.
+
+        local float_amount =
+            external_shot_float
+
+        if float_amount > 0.0 then
+
+            local t =
+                external_noise_time
+
+            local position_float =
+                AFK_EXTERIOR_FLOAT_POS
+                * external_aircraft_scale
+                * float_amount
+
+            external_current_x =
+                external_current_x
+                + cockpit_wave(t, 0.82, 1.32, 2.32, 19)
+                * position_float
+
+            external_current_y =
+                external_current_y
+                + cockpit_wave(t, 0.71, 1.17, 2.05, 22)
+                * position_float
+
+            external_current_z =
+                external_current_z
+                + cockpit_wave(t, 0.93, 1.51, 2.11, 25)
+                * position_float
 
         end
 
@@ -4394,25 +5087,66 @@ external_camera_callback = ffi.cast(
 
 
         -- ----------------------------------------------------
-        -- Aim at aircraft visual center
+        -- KEEP THE CAMERA ABOVE THE GROUND
         -- ----------------------------------------------------
         --
-        -- The target point is attached to the aircraft itself.
-        -- This is important while the aircraft pitches or banks:
-        -- the camera continues to look at the same physical point
-        -- on the airplane instead of a fixed world-relative point.
+        -- Runs before the aim is worked out, so the framing
+        -- follows the camera that is actually used rather than
+        -- the one underground.
+
+        local ground_y =
+            afk_plane_local_y
+            - (tonumber(afk_plane_y_agl) or 0.0)
+
+        local lowest_camera_y =
+            ground_y
+            + AFK_EXTERIOR_GROUND_CLEARANCE
+            * external_aircraft_scale
+
+        if out_camera.y < lowest_camera_y then
+            out_camera.y = lowest_camera_y
+        end
+
+
+        -- ----------------------------------------------------
+        -- Aim at the subject
+        -- ----------------------------------------------------
         --
-        -- Reuse the proven aircraft-to-world transform already used
-        -- by the cockpit camera.
+        -- The subject is a point attached to the airframe, so
+        -- while the aircraft pitches or banks the camera keeps
+        -- framing the same physical spot rather than a point in
+        -- the world. When the shot names a second subject the
+        -- framing slides between them as the move runs.
+
+        local look_x =
+            external_look_start_x
+            + (
+                external_look_end_x
+                - external_look_start_x
+            ) * progress
+
+        local look_y =
+            external_look_start_y
+            + (
+                external_look_end_y
+                - external_look_start_y
+            ) * progress
+
+        local look_z =
+            external_look_start_z
+            + (
+                external_look_end_z
+                - external_look_start_z
+            ) * progress
+
 
         local target_offset_x,
               target_offset_y,
               target_offset_z =
             cockpit_aircraft_to_world(
-                0.0,
-                AFK_EXTERNAL_TARGET_HEIGHT
-                * external_aircraft_scale,
-                0.0,
+                look_x,
+                look_y,
+                look_z,
                 afk_plane_pitch,
                 afk_plane_roll,
                 afk_plane_heading
@@ -4449,11 +5183,10 @@ external_camera_callback = ffi.cast(
             )
 
         if horizontal_distance < 0.1 then
-            horizontal_distance =
-                0.1
+            horizontal_distance = 0.1
         end
 
-        out_camera.heading =
+        local camera_heading =
             math.deg(
                 math.atan2(
                     to_target_x,
@@ -4461,7 +5194,7 @@ external_camera_callback = ffi.cast(
                 )
             )
 
-        out_camera.pitch =
+        local camera_pitch =
             math.deg(
                 math.atan2(
                     to_target_y,
@@ -4469,11 +5202,51 @@ external_camera_callback = ffi.cast(
                 )
             )
 
+
+        -- ----------------------------------------------------
+        -- Lens, dutch angle and angular float
+        -- ----------------------------------------------------
+
+        if float_amount > 0.0 then
+
+            local t =
+                external_noise_time
+
+            local angle_float =
+                AFK_EXTERIOR_FLOAT_ANGLE
+                * float_amount
+
+            camera_heading =
+                camera_heading
+                + cockpit_wave(t, 0.61, 1.03, 1.79, 28)
+                * angle_float
+
+            camera_pitch =
+                camera_pitch
+                + cockpit_wave(t, 0.57, 0.99, 1.71, 31)
+                * angle_float
+
+        end
+
+        out_camera.heading =
+            camera_heading
+
+        out_camera.pitch =
+            camera_pitch
+
         out_camera.roll =
-            0.0
+            external_roll_start
+            + (
+                external_roll_end
+                - external_roll_start
+            ) * progress
 
         out_camera.zoom =
-            AFK_EXTERNAL_ZOOM
+            external_zoom_start
+            + (
+                external_zoom_end
+                - external_zoom_start
+            ) * progress
 
         return 1
 
@@ -4512,9 +5285,14 @@ function start_external_circle_camera()
     external_camera_controlled =
         true
 
-    -- First shot is also selected from the randomized no-repeat bag.
+    -- First shot is also selected from the randomized no-repeat
+    -- bag, from whichever library matches the aircraft's state.
+    local library, first_index =
+        get_next_external_shot()
+
     external_prepare_shot(
-        get_next_external_shot_index()
+        library,
+        first_index
     )
 
     XPLM.XPLMControlCamera(
@@ -5694,6 +6472,19 @@ function afk_director_update()
 
 
     -- --------------------------------------------------------
+    -- Parked or moving
+    -- --------------------------------------------------------
+    --
+    -- Decides which exterior library the next cut draws from.
+    -- Runs every frame, not just during AFK, so the hysteresis
+    -- has already settled by the time AFK starts.
+
+    afk_update_parked_state(
+        delta_time
+    )
+
+
+    -- --------------------------------------------------------
     -- Manual trigger
     -- --------------------------------------------------------
     --
@@ -6133,7 +6924,13 @@ function afk_debug_display()
             )
             .. " / "
             .. tostring(
-                #AFK_EXTERNAL_SHOTS
+                #external_current_library
+            )
+            .. "   Coverage: "
+            .. (
+                afk_exterior_parked
+                and "PARKED (close-up)"
+                or "FLIGHT"
             )
         )
 
@@ -6335,7 +7132,14 @@ logMsg(
 )
 
 logMsg(
-    "AFK exterior mode: Constant-speed cinematic cut shots"
+    "AFK exterior parked shots: "
+    .. tostring(#AFK_EXTERIOR_PARKED_SHOTS)
+    .. " close-up / detail"
+)
+
+logMsg(
+    "AFK exterior flight shots: "
+    .. tostring(#AFK_EXTERIOR_FLIGHT_SHOTS)
 )
 
 logMsg(
