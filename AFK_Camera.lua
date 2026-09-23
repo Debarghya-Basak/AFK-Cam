@@ -30,6 +30,17 @@ local DEFAULT_AFK_TIMEOUT = 30.0
 --   false = hidden
 local DEFAULT_AFK_DEBUG_HUD = true
 
+-- Cockpit head movement, as a percentage of the built-in
+-- motion. 100 is the tuned default.
+--
+--   size  = how far the head moves, and how much idle life
+--           (breathing, sway, tremor) it carries. Lower is
+--           more subtle.
+--   speed = how quickly it travels between looks. Lower is
+--           more relaxed. Dwell times are not affected.
+local DEFAULT_AFK_HEAD_SIZE = 100.0
+local DEFAULT_AFK_HEAD_SPEED = 100.0
+
 -- How AFK starts.
 --   true  = automatic, when the idle timer runs out
 --   false = manual only, when the bound key/button is pressed
@@ -71,6 +82,15 @@ local afk_debug_hud_visible = DEFAULT_AFK_DEBUG_HUD
 
 local afk_auto_entry = DEFAULT_AFK_AUTO_ENTRY
 
+local afk_head_size = DEFAULT_AFK_HEAD_SIZE
+local afk_head_speed = DEFAULT_AFK_HEAD_SPEED
+
+local AFK_HEAD_SIZE_MIN = 25.0
+local AFK_HEAD_SIZE_MAX = 150.0
+
+local AFK_HEAD_SPEED_MIN = 50.0
+local AFK_HEAD_SPEED_MAX = 150.0
+
 local afk_mouse_move_return = DEFAULT_AFK_MOUSE_MOVE_RETURN
 
 -- Percent. Divide by 100 before comparing with raw axis values.
@@ -98,6 +118,28 @@ function clamp_afk_timeout(value)
 
     if v > AFK_TIMEOUT_MAX then
         v = AFK_TIMEOUT_MAX
+    end
+
+    return v
+
+end
+
+
+function clamp_afk_percent(value, min_value, max_value, fallback)
+
+    local v =
+        tonumber(value)
+
+    if v == nil then
+        return fallback
+    end
+
+    if v < min_value then
+        v = min_value
+    end
+
+    if v > max_value then
+        v = max_value
     end
 
     return v
@@ -189,6 +231,26 @@ function load_afk_settings()
                     or normalized == "true"
                     or normalized == "yes"
 
+            elseif key == "head_size" then
+
+                afk_head_size =
+                    clamp_afk_percent(
+                        value,
+                        AFK_HEAD_SIZE_MIN,
+                        AFK_HEAD_SIZE_MAX,
+                        DEFAULT_AFK_HEAD_SIZE
+                    )
+
+            elseif key == "head_speed" then
+
+                afk_head_speed =
+                    clamp_afk_percent(
+                        value,
+                        AFK_HEAD_SPEED_MIN,
+                        AFK_HEAD_SPEED_MAX,
+                        DEFAULT_AFK_HEAD_SPEED
+                    )
+
             elseif key == "mouse_move" then
 
                 local normalized =
@@ -232,6 +294,12 @@ function restore_afk_defaults()
 
     afk_auto_entry =
         DEFAULT_AFK_AUTO_ENTRY
+
+    afk_head_size =
+        DEFAULT_AFK_HEAD_SIZE
+
+    afk_head_speed =
+        DEFAULT_AFK_HEAD_SPEED
 
     afk_mouse_move_return =
         DEFAULT_AFK_MOUSE_MOVE_RETURN
@@ -284,6 +352,17 @@ function restore_afk_defaults()
         .. tostring(
             afk_auto_entry
         )
+        .. " | Head="
+        .. string.format(
+            "%.0f",
+            afk_head_size
+        )
+        .. "/"
+        .. string.format(
+            "%.0f",
+            afk_head_speed
+        )
+        .. " %"
         .. " | MouseMove="
         .. tostring(
             afk_mouse_move_return
@@ -348,6 +427,24 @@ function save_afk_settings()
     )
 
     file:write(
+        "head_size=",
+        string.format(
+            "%.0f",
+            afk_head_size
+        ),
+        "\n"
+    )
+
+    file:write(
+        "head_speed=",
+        string.format(
+            "%.0f",
+            afk_head_speed
+        ),
+        "\n"
+    )
+
+    file:write(
         "mouse_move=",
         afk_mouse_move_return and "1" or "0",
         "\n"
@@ -383,6 +480,17 @@ function save_afk_settings()
         .. tostring(
             afk_auto_entry
         )
+        .. " | Head="
+        .. string.format(
+            "%.0f",
+            afk_head_size
+        )
+        .. "/"
+        .. string.format(
+            "%.0f",
+            afk_head_speed
+        )
+        .. " %"
         .. " | MouseMove="
         .. tostring(
             afk_mouse_move_return
@@ -682,15 +790,28 @@ local COCKPIT_HEAD = {
     -- Spring frequency in Hz and damping ratio. Higher
     -- frequency is snappier. Damping below 1.0 overshoots
     -- slightly and settles back, which is what a head does.
-    spring_frequency = 0.85,
+    spring_frequency = 0.55,
     spring_damping = 0.72,
 
     -- Neck pitch muscles are slower than yaw.
-    pitch_spring_scale = 0.86,
+    pitch_spring_scale = 0.88,
+
+    -- Most the neck will turn, in degrees per second.
+    --
+    -- A plain spring reaches its target in the same time no
+    -- matter how far it has to go, so a wide look ends up
+    -- whipping round far faster than a small one. Capping the
+    -- rate means a longer look simply takes longer, which is
+    -- how a real neck behaves, and it is what keeps the wide
+    -- shoulder checks from feeling rushed.
+    --
+    -- Set to 0 for no limit.
+    max_yaw_rate = 30.0,
+    max_pitch_rate = 24.0,
 
     -- Counter-movement before a turn, as a fraction of the
     -- turn size. 0 disables it.
-    windup = 0.12,
+    windup = 0.07,
 
     -- Head tilt into a turn, degrees of roll per degree/second
     -- of yaw, and the most tilt allowed. Negate roll_coupling
@@ -710,13 +831,13 @@ local COCKPIT_HEAD = {
     breath_pitch = 0.14,
 
     -- Slow postural sway, in degrees and metres.
-    drift_psi = 0.55,
-    drift_the = 0.38,
-    drift_phi = 0.42,
-    drift_pos = 0.0045,
+    drift_psi = 0.45,
+    drift_the = 0.32,
+    drift_phi = 0.35,
+    drift_pos = 0.0040,
 
     -- Micro tremor, in degrees.
-    tremor = 0.035,
+    tremor = 0.030,
 
     -- Seconds for the idle-life layer to fade up from nothing
     -- when AFK begins. Without this the breathing, sway and
@@ -2243,28 +2364,278 @@ local cockpit_target_heading = 0.0
 local cockpit_target_pitch = 0.0
 
 
--- How far the pilot looks to the left
-local COCKPIT_LEFT_ANGLE = 25.0
-
--- How long each movement takes
-local COCKPIT_MOVE_TIME = 2.5
-
--- How long to stay looking left
-local COCKPIT_HOLD_TIME = 1.5
-
 -- How long to stay centered
 local COCKPIT_CENTER_HOLD = 2.0
 
-local COCKPIT_RIGHT_ANGLE = 25.0
 
-local COCKPIT_DOWN_ANGLE = 12.0
+-- ============================================================
+-- COCKPIT LOOK LIBRARY
+-- ============================================================
+--
+-- Every place the pilot can look. Adding one is a single row;
+-- nothing else in the script needs to change.
+--
+--   name     shown on the debug HUD
+--   heading  {min, max} degrees from the resting head, negative
+--            is left, positive is right
+--   pitch    {min, max} degrees, negative is down
+--   weight   how often it is picked, relative to the others
+--   hold     optional {min, max} seconds to dwell there. Left
+--            out, the default skewed dwell time is used.
+--
+-- The angles are randomised within their range every time, so a
+-- look is never repeated exactly.
+--
+-- Note that overhead and pedestal geometry differs a lot
+-- between aircraft. These ranges are deliberately moderate so
+-- they read correctly in most cockpits rather than being exact
+-- for one airframe.
 
-local COCKPIT_PANEL_LEFT = 15.0
-local COCKPIT_PANEL_DOWN = 8.0
+local AFK_COCKPIT_LOOKS = {
 
-local COCKPIT_PANEL_RIGHT = 15.0
+    -- --------------------------------------------------------
+    -- BACK TO CENTRE
+    -- --------------------------------------------------------
+    --
+    -- Returning to the resting pose is just another place to
+    -- look, picked by the same weighted draw as everything
+    -- else. It carries a much heavier weight than any single
+    -- look, so it is still the most common destination by far,
+    -- but the head no longer passes through centre after every
+    -- single movement. Sometimes it runs straight on from the
+    -- pedestal to the overhead and back out the window.
+    --
+    -- no_history keeps it out of the recently-used list, which
+    -- would otherwise lock it out for several picks at a time
+    -- and force an unnaturally regular rhythm. An immediate
+    -- repeat is still blocked.
 
-local cockpit_last_random_choice = 0
+    {
+        name = "CENTER",
+        heading = { 0.0, 0.0 },
+        pitch = { 0.0, 0.0 },
+        weight = 14.0,
+        hold = { 2.2, 6.0 },
+        no_history = true
+    },
+
+    -- --------------------------------------------------------
+    -- SUBTLE MOVEMENT
+    -- --------------------------------------------------------
+    --
+    -- Small, frequent, unhurried. These carry most of the
+    -- running time and are what stops the head from looking
+    -- like it is cycling through a list of poses.
+
+    {
+        name = "SETTLE",
+        heading = { -2.2, 2.2 },
+        pitch = { -1.5, 1.2 },
+        weight = 7.0,
+        hold = { 3.0, 8.0 }
+    },
+    {
+        name = "GLANCE LEFT",
+        heading = { -9.0, -4.5 },
+        pitch = { -2.0, 1.2 },
+        weight = 6.0,
+        hold = { 2.2, 5.5 }
+    },
+    {
+        name = "GLANCE RIGHT",
+        heading = { 4.5, 9.0 },
+        pitch = { -2.0, 1.2 },
+        weight = 6.0,
+        hold = { 2.2, 5.5 }
+    },
+    {
+        name = "SMALL NOD DOWN",
+        heading = { -3.0, 3.0 },
+        pitch = { -6.0, -3.0 },
+        weight = 5.0,
+        hold = { 2.0, 5.0 }
+    },
+    {
+        name = "EASE UP",
+        heading = { -3.0, 3.0 },
+        pitch = { 2.0, 4.5 },
+        weight = 4.0,
+        hold = { 2.5, 6.5 }
+    },
+
+    -- --------------------------------------------------------
+    -- OUTSIDE
+    -- --------------------------------------------------------
+
+    {
+        name = "LOOK LEFT",
+        heading = { -27.0, -18.0 },
+        pitch = { -3.0, 2.0 },
+        weight = 5.0
+    },
+    {
+        name = "LOOK RIGHT",
+        heading = { 18.0, 27.0 },
+        pitch = { -3.0, 2.0 },
+        weight = 5.0
+    },
+    {
+        name = "SHOULDER CHECK LEFT",
+        heading = { -48.0, -36.0 },
+        pitch = { -4.5, 2.0 },
+        weight = 1.6,
+        hold = { 2.0, 4.5 }
+    },
+    {
+        name = "SHOULDER CHECK RIGHT",
+        heading = { 36.0, 48.0 },
+        pitch = { -4.5, 2.0 },
+        weight = 1.6,
+        hold = { 2.0, 4.5 }
+    },
+    {
+        name = "HORIZON SCAN",
+        heading = { -7.0, 7.0 },
+        pitch = { 1.5, 4.5 },
+        weight = 5.0
+    },
+    {
+        name = "SKY CHECK",
+        heading = { -9.0, 9.0 },
+        pitch = { 8.0, 14.0 },
+        weight = 2.2,
+        hold = { 2.5, 6.0 }
+    },
+    {
+        name = "DOWN LEFT WINDOW",
+        heading = { -33.0, -22.0 },
+        pitch = { -18.0, -10.0 },
+        weight = 2.0
+    },
+    {
+        name = "DOWN RIGHT WINDOW",
+        heading = { 22.0, 33.0 },
+        pitch = { -18.0, -10.0 },
+        weight = 2.0
+    },
+
+    -- --------------------------------------------------------
+    -- MAIN PANEL
+    -- --------------------------------------------------------
+
+    {
+        name = "PRIMARY FLIGHT DISPLAY",
+        heading = { -7.0, 3.0 },
+        pitch = { -17.0, -10.0 },
+        weight = 6.0,
+        hold = { 2.5, 7.0 }
+    },
+    {
+        name = "LOOK PANEL LEFT",
+        heading = { -19.0, -11.0 },
+        pitch = { -11.0, -5.5 },
+        weight = 4.0
+    },
+    {
+        name = "LOOK PANEL RIGHT",
+        heading = { 11.0, 19.0 },
+        pitch = { -11.0, -5.5 },
+        weight = 4.0
+    },
+    {
+        name = "STANDBY INSTRUMENTS",
+        heading = { -14.0, -6.0 },
+        pitch = { -19.0, -13.0 },
+        weight = 2.0,
+        hold = { 2.2, 5.0 }
+    },
+
+    -- --------------------------------------------------------
+    -- OVERHEAD PANEL
+    -- --------------------------------------------------------
+
+    {
+        name = "OVERHEAD PANEL",
+        heading = { -7.0, 7.0 },
+        pitch = { 23.0, 33.0 },
+        weight = 2.0,
+        hold = { 2.5, 7.0 }
+    },
+    {
+        name = "OVERHEAD LEFT",
+        heading = { -16.0, -7.0 },
+        pitch = { 21.0, 30.0 },
+        weight = 1.4,
+        hold = { 2.2, 5.5 }
+    },
+    {
+        name = "OVERHEAD RIGHT",
+        heading = { 7.0, 16.0 },
+        pitch = { 21.0, 30.0 },
+        weight = 1.4,
+        hold = { 2.2, 5.5 }
+    },
+
+    -- --------------------------------------------------------
+    -- CENTER PEDESTAL
+    -- --------------------------------------------------------
+
+    {
+        name = "CENTER PEDESTAL",
+        heading = { -6.0, 6.0 },
+        pitch = { -36.0, -26.0 },
+        weight = 2.6,
+        hold = { 2.5, 7.0 }
+    },
+    {
+        name = "THROTTLE QUADRANT",
+        heading = { -9.0, 1.0 },
+        pitch = { -33.0, -24.0 },
+        weight = 2.2,
+        hold = { 2.2, 5.5 }
+    },
+    {
+        name = "PEDESTAL RADIOS",
+        heading = { 2.0, 12.0 },
+        pitch = { -34.0, -25.0 },
+        weight = 2.0,
+        hold = { 2.5, 7.0 }
+    },
+    {
+        name = "TRIM AND FLAPS",
+        heading = { -12.0, -3.0 },
+        pitch = { -38.0, -29.0 },
+        weight = 1.5,
+        hold = { 2.0, 5.0 }
+    }
+
+}
+
+
+-- How many recent looks are blocked from being picked again.
+local COCKPIT_LOOK_HISTORY = 5
+
+local cockpit_look_history = {}
+
+local cockpit_current_look = 0
+
+-- Blocks an immediate repeat even for looks kept out of the
+-- recently-used list.
+local cockpit_last_look = 0
+
+-- "CENTER" only until the first look is picked, then
+-- "MOVE" while travelling and "HOLD" while dwelling.
+local cockpit_shot_phase = "CENTER"
+
+local cockpit_look_weight_total = 0.0
+
+for i = 1, #AFK_COCKPIT_LOOKS do
+
+    cockpit_look_weight_total =
+        cockpit_look_weight_total
+        + (AFK_COCKPIT_LOOKS[i].weight or 1.0)
+
+end
 
 math.randomseed(os.time())
 
@@ -2549,24 +2920,17 @@ function cockpit_random_hold()
     if roll < 0.55 then
 
         -- Quick glance.
-        return cockpit_random_range(1.6, 4.5)
+        return cockpit_random_range(2.5, 6.5)
 
     elseif roll < 0.88 then
 
         -- Ordinary look.
-        return cockpit_random_range(4.5, 12.0)
+        return cockpit_random_range(6.5, 16.0)
 
     end
 
     -- Occasional long stare out of the window.
-    return cockpit_random_range(12.0, 28.0)
-
-end
-
-
-function cockpit_random_center_hold()
-
-    return cockpit_random_range(1.2, 4.0)
+    return cockpit_random_range(16.0, 34.0)
 
 end
 
@@ -2582,21 +2946,37 @@ function cockpit_estimate_move_time(delta_heading, delta_pitch)
             + delta_pitch * delta_pitch
         )
 
+    -- Fitted against the rate-limited spring: a short look
+    -- settles in about 1.7 s and a wide one in about 2.1 s.
     local move_time =
-        0.55
-        + distance * 0.022
+        1.70
+        + distance * 0.010
 
     -- Nobody moves at exactly the same speed twice.
     move_time =
         move_time
-        * cockpit_random_range(0.88, 1.15)
+        * cockpit_random_range(0.92, 1.20)
 
-    if move_time < 0.45 then
-        move_time = 0.45
+
+    -- A slower head needs proportionally longer to arrive, so
+    -- the phase change still lands when the movement finishes.
+    local speed =
+        afk_head_speed / 100.0
+
+    if speed < 0.1 then
+        speed = 0.1
     end
 
-    if move_time > 2.4 then
-        move_time = 2.4
+    move_time =
+        move_time / speed
+
+
+    if move_time < 1.60 / speed then
+        move_time = 1.60 / speed
+    end
+
+    if move_time > 2.80 / speed then
+        move_time = 2.80 / speed
     end
 
     return move_time
@@ -2606,113 +2986,223 @@ end
 
 -- Every look carries a little movement on the other axis too.
 -- Purely horizontal or purely vertical head turns look wrong.
-function cockpit_start_random_shot()
+function cockpit_look_was_recent(index)
 
-    local choice
+    -- Never twice in a row, whatever the entry.
+    if index == cockpit_last_look then
+        return true
+    end
 
-    repeat
-        choice = math.random(1, 5)
-    until choice ~= cockpit_last_random_choice
+    for i = 1, #cockpit_look_history do
 
-    cockpit_last_random_choice = choice
+        if cockpit_look_history[i] == index then
+            return true
+        end
 
+    end
 
-    if choice == 1 then
+    return false
 
-        -- LOOK LEFT
-
-        cockpit_set_shot(
-            "LOOK LEFT",
-
-            cockpit_base_head_psi
-            - cockpit_random_range(20.0, 30.0),
-
-            cockpit_base_head_the
-            + cockpit_random_range(-3.5, 2.0),
-
-            nil
-        )
+end
 
 
-    elseif choice == 2 then
+function cockpit_remember_look(index)
 
-        -- LOOK RIGHT
+    cockpit_last_look =
+        index
 
-        cockpit_set_shot(
-            "LOOK RIGHT",
+    local look =
+        AFK_COCKPIT_LOOKS[index]
 
-            cockpit_base_head_psi
-            + cockpit_random_range(20.0, 30.0),
+    -- Entries flagged no_history stay eligible. Centre is the
+    -- one that matters: parking it in the recently-used list
+    -- would cap how often the head can come back to rest.
+    if look ~= nil
+    and look.no_history then
+        return
+    end
 
-            cockpit_base_head_the
-            + cockpit_random_range(-3.5, 2.0),
+    cockpit_look_history[#cockpit_look_history + 1] =
+        index
 
-            nil
-        )
-
-
-    elseif choice == 3 then
-
-        -- LOOK DOWN
-
-        cockpit_set_shot(
-            "LOOK DOWN",
-
-            cockpit_base_head_psi
-            + cockpit_random_range(-4.0, 4.0),
-
-            cockpit_base_head_the
-            - cockpit_random_range(8.0, 14.0),
-
-            nil
-        )
-
-
-    elseif choice == 4 then
-
-        -- LEFT INSTRUMENT PANEL
-
-        cockpit_set_shot(
-            "LOOK PANEL LEFT",
-
-            cockpit_base_head_psi
-            - cockpit_random_range(11.0, 19.0),
-
-            cockpit_base_head_the
-            - cockpit_random_range(5.5, 10.5),
-
-            nil
-        )
-
-
-    else
-
-        -- RIGHT INSTRUMENT PANEL
-
-        cockpit_set_shot(
-            "LOOK PANEL RIGHT",
-
-            cockpit_base_head_psi
-            + cockpit_random_range(11.0, 19.0),
-
-            cockpit_base_head_the
-            - cockpit_random_range(5.5, 10.5),
-
-            nil
-        )
-
+    while #cockpit_look_history > COCKPIT_LOOK_HISTORY do
+        table.remove(cockpit_look_history, 1)
     end
 
 end
 
 
-function cockpit_return_to_center()
+-- Weighted pick that skips anything used recently, so the same
+-- few looks cannot cluster together.
+function cockpit_pick_look()
+
+    local count =
+        #AFK_COCKPIT_LOOKS
+
+    if count == 0 then
+        return nil
+    end
+
+
+    for attempt = 1, 12 do
+
+        local target =
+            math.random()
+            * cockpit_look_weight_total
+
+        local accumulated =
+            0.0
+
+        local picked =
+            count
+
+        for i = 1, count do
+
+            accumulated =
+                accumulated
+                + (AFK_COCKPIT_LOOKS[i].weight or 1.0)
+
+            if target <= accumulated then
+                picked = i
+                break
+            end
+
+        end
+
+        if not cockpit_look_was_recent(picked) then
+            return picked
+        end
+
+    end
+
+
+    -- Every draw came back recent. Scan from a random start so
+    -- the fallback is not always the same entry.
+    local offset =
+        math.random(count)
+
+    for i = 0, count - 1 do
+
+        local index =
+            ((offset + i - 1) % count) + 1
+
+        if not cockpit_look_was_recent(index) then
+            return index
+        end
+
+    end
+
+    return math.random(count)
+
+end
+
+
+-- ============================================================
+-- COCKPIT SHOT PHASES
+-- ============================================================
+--
+-- MOVE   travelling to a look
+-- HOLD   dwelling on it
+-- RETURN travelling back to the resting pose
+-- CENTER resting before the next look
+
+function cockpit_apply_look(index)
+
+    local look =
+        AFK_COCKPIT_LOOKS[index]
+
+    if look == nil then
+
+        -- Should not happen. Rest at the entry pose.
+        cockpit_shot_phase =
+            "MOVE"
+
+        cockpit_set_shot(
+            "CENTER",
+            cockpit_base_head_psi,
+            cockpit_base_head_the,
+            nil
+        )
+
+        return
+
+    end
+
+    cockpit_current_look =
+        index
+
+    cockpit_remember_look(index)
+
+    cockpit_shot_phase =
+        "MOVE"
+
+    -- The size setting scales how far from the resting pose
+    -- each look reaches. At low settings the head only hints
+    -- toward the overhead panel or pedestal rather than fully
+    -- turning to face it, which is the point of a subtle
+    -- setting.
+    local size =
+        afk_head_size / 100.0
 
     cockpit_set_shot(
-        "CENTER HOLD",
-        cockpit_base_head_psi,
-        cockpit_base_head_the,
-        cockpit_random_center_hold()
+        look.name,
+
+        cockpit_base_head_psi
+        + cockpit_random_range(
+            look.heading[1],
+            look.heading[2]
+        ) * size,
+
+        cockpit_base_head_the
+        + cockpit_random_range(
+            look.pitch[1],
+            look.pitch[2]
+        ) * size,
+
+        nil
+    )
+
+end
+
+
+function cockpit_begin_hold()
+
+    local look =
+        AFK_COCKPIT_LOOKS[cockpit_current_look]
+
+    local hold_time
+
+    if look ~= nil
+    and look.hold ~= nil then
+
+        hold_time =
+            cockpit_random_range(
+                look.hold[1],
+                look.hold[2]
+            )
+
+    else
+
+        hold_time =
+            cockpit_random_hold()
+
+    end
+
+    cockpit_shot_phase =
+        "HOLD"
+
+    -- Same target as the move that just finished, so the head
+    -- simply settles where it arrived.
+    cockpit_set_shot(
+        "HOLD "
+        .. (
+            look ~= nil
+            and look.name
+            or "CENTER"
+        ),
+        cockpit_target_heading,
+        cockpit_target_pitch,
+        hold_time
     )
 
 end
@@ -2749,155 +3239,23 @@ function cockpit_director_update(delta_time)
 
     if cockpit_shot_time >= cockpit_shot_duration then
 
-        if cockpit_shot == "CENTER" then
+        -- Arrive, dwell, then pick somewhere new. Coming back
+        -- to centre is one of the things that can be picked,
+        -- so there is no separate return step any more.
+        if cockpit_shot_phase == "MOVE" then
 
-            -- Initial center hold finished.
-            -- Pick a random direction.
+            cockpit_begin_hold()
 
-            cockpit_start_random_shot()
+        else
 
-
-        elseif cockpit_shot == "LOOK LEFT" then
-
-            -- LEFT -> HOLD LEFT
-
-            cockpit_set_shot(
-                "HOLD LEFT",
-                cockpit_target_heading,
-                cockpit_target_pitch,
-                cockpit_random_hold()
+            cockpit_apply_look(
+                cockpit_pick_look()
             )
-
-
-        elseif cockpit_shot == "HOLD LEFT" then
-
-            -- LEFT -> CENTER
-
-            cockpit_set_shot(
-                "RETURN CENTER LEFT",
-                cockpit_base_head_psi,
-                cockpit_base_head_the,
-                nil
-            )
-
-
-        elseif cockpit_shot == "LOOK RIGHT" then
-
-            -- RIGHT -> HOLD RIGHT
-
-            cockpit_set_shot(
-                "HOLD RIGHT",
-                cockpit_target_heading,
-                cockpit_target_pitch,
-                cockpit_random_hold()
-            )
-
-
-        elseif cockpit_shot == "HOLD RIGHT" then
-
-            -- RIGHT -> CENTER
-
-            cockpit_set_shot(
-                "RETURN CENTER RIGHT",
-                cockpit_base_head_psi,
-                cockpit_base_head_the,
-                nil
-            )
-
-
-        elseif cockpit_shot == "LOOK DOWN" then
-
-            -- DOWN -> HOLD
-
-            cockpit_set_shot(
-                "HOLD DOWN",
-                cockpit_target_heading,
-                cockpit_target_pitch,
-                cockpit_random_hold()
-            )
-
-
-        elseif cockpit_shot == "HOLD DOWN" then
-
-            -- DOWN -> CENTER
-
-            cockpit_set_shot(
-                "RETURN CENTER DOWN",
-                cockpit_base_head_psi,
-                cockpit_base_head_the,
-                nil
-            )
-
-
-        elseif cockpit_shot == "LOOK PANEL LEFT" then
-
-            -- PANEL LEFT -> HOLD
-
-            cockpit_set_shot(
-                "HOLD PANEL LEFT",
-                cockpit_target_heading,
-                cockpit_target_pitch,
-                cockpit_random_hold()
-            )
-
-
-        elseif cockpit_shot == "HOLD PANEL LEFT" then
-
-            -- PANEL LEFT -> CENTER
-
-            cockpit_set_shot(
-                "RETURN CENTER PANEL LEFT",
-                cockpit_base_head_psi,
-                cockpit_base_head_the,
-                nil
-            )
-
-
-        elseif cockpit_shot == "LOOK PANEL RIGHT" then
-
-            -- PANEL RIGHT -> HOLD
-
-            cockpit_set_shot(
-                "HOLD PANEL RIGHT",
-                cockpit_target_heading,
-                cockpit_target_pitch,
-                cockpit_random_hold()
-            )
-
-
-        elseif cockpit_shot == "HOLD PANEL RIGHT" then
-
-            -- PANEL RIGHT -> CENTER
-
-            cockpit_set_shot(
-                "RETURN CENTER PANEL RIGHT",
-                cockpit_base_head_psi,
-                cockpit_base_head_the,
-                nil
-            )
-
-
-        elseif cockpit_shot == "RETURN CENTER LEFT"
-            or cockpit_shot == "RETURN CENTER RIGHT"
-            or cockpit_shot == "RETURN CENTER DOWN"
-            or cockpit_shot == "RETURN CENTER PANEL LEFT"
-            or cockpit_shot == "RETURN CENTER PANEL RIGHT" then
-
-            -- After every movement, pause in center.
-
-            cockpit_return_to_center()
-
-
-        elseif cockpit_shot == "CENTER HOLD" then
-
-            -- Center pause finished.
-            -- Pick another random shot.
-
-            cockpit_start_random_shot()
 
         end
+
     end
-    
+
         -- ----------------------------------------------------
         -- MUSCLE DYNAMICS
         -- ----------------------------------------------------
@@ -2919,14 +3277,31 @@ function cockpit_director_update(delta_time)
         local step_time =
             delta_time / steps
 
+        local head_speed =
+            afk_head_speed / 100.0
+
+        if head_speed < 0.1 then
+            head_speed = 0.1
+        end
+
         local omega_psi =
             2.0
             * math.pi
             * COCKPIT_HEAD.spring_frequency
+            * head_speed
 
         local omega_the =
             omega_psi
             * COCKPIT_HEAD.pitch_spring_scale
+
+        -- Hoisted out of the step loop below.
+        local max_yaw_rate =
+            COCKPIT_HEAD.max_yaw_rate
+            * head_speed
+
+        local max_pitch_rate =
+            COCKPIT_HEAD.max_pitch_rate
+            * head_speed
 
 
         for step = 1, steps do
@@ -2946,6 +3321,24 @@ function cockpit_director_update(delta_time)
             cockpit_anim_psi_velocity =
                 cockpit_anim_psi_velocity
                 + psi_accel * step_time
+
+            if max_yaw_rate > 0 then
+
+                if cockpit_anim_psi_velocity
+                    > max_yaw_rate then
+
+                    cockpit_anim_psi_velocity =
+                        max_yaw_rate
+
+                elseif cockpit_anim_psi_velocity
+                    < -max_yaw_rate then
+
+                    cockpit_anim_psi_velocity =
+                        -max_yaw_rate
+
+                end
+
+            end
 
             cockpit_anim_psi =
                 cockpit_anim_psi
@@ -2967,6 +3360,24 @@ function cockpit_director_update(delta_time)
             cockpit_anim_the_velocity =
                 cockpit_anim_the_velocity
                 + the_accel * step_time
+
+            if max_pitch_rate > 0 then
+
+                if cockpit_anim_the_velocity
+                    > max_pitch_rate then
+
+                    cockpit_anim_the_velocity =
+                        max_pitch_rate
+
+                elseif cockpit_anim_the_velocity
+                    < -max_pitch_rate then
+
+                    cockpit_anim_the_velocity =
+                        -max_pitch_rate
+
+                end
+
+            end
 
             cockpit_anim_the =
                 cockpit_anim_the
@@ -3040,10 +3451,14 @@ function cockpit_director_update(delta_time)
 
             end
 
+            -- The size setting rides on the fade-in blend, so
+            -- it scales breathing, sway, tremor, and through
+            -- them the neck pivot, all in one place.
             local life =
                 cockpit_smoothstep(
                     cockpit_life_blend
                 )
+                * (afk_head_size / 100.0)
 
 
             -- Slow postural sway.
@@ -3467,6 +3882,18 @@ function start_cockpit_camera()
 
     current_shot =
         "CENTER"
+
+    cockpit_shot_phase =
+        "CENTER"
+
+    cockpit_current_look =
+        0
+
+    -- Fresh session, so nothing counts as recently used.
+    cockpit_look_history = {}
+
+    cockpit_last_look =
+        0
 
     cockpit_shot_time = 0.0
 
@@ -4206,7 +4633,7 @@ function afk_settings_show_wnd()
     afk_settings_wnd =
         float_wnd_create(
             470,
-            640,
+            740,
             1,
             true
         )
@@ -4471,6 +4898,84 @@ function afk_settings_on_build(wnd, x, y)
 
         imgui.TextUnformatted(
             "Not used while AFK entry is manual."
+        )
+
+    end
+
+
+    imgui.TextUnformatted("")
+
+
+    -- --------------------------------------------------------
+    -- COCKPIT HEAD MOVEMENT
+    -- --------------------------------------------------------
+
+    imgui.TextUnformatted(
+        "Cockpit head movement"
+    )
+
+    local size_changed, new_head_size =
+        imgui.SliderFloat(
+            "Movement size",
+            afk_head_size,
+            AFK_HEAD_SIZE_MIN,
+            AFK_HEAD_SIZE_MAX,
+            "%.0f %%"
+        )
+
+    if size_changed then
+
+        afk_head_size =
+            clamp_afk_percent(
+                new_head_size,
+                AFK_HEAD_SIZE_MIN,
+                AFK_HEAD_SIZE_MAX,
+                DEFAULT_AFK_HEAD_SIZE
+            )
+
+    end
+
+    local speed_changed, new_head_speed =
+        imgui.SliderFloat(
+            "Movement speed",
+            afk_head_speed,
+            AFK_HEAD_SPEED_MIN,
+            AFK_HEAD_SPEED_MAX,
+            "%.0f %%"
+        )
+
+    if speed_changed then
+
+        afk_head_speed =
+            clamp_afk_percent(
+                new_head_speed,
+                AFK_HEAD_SPEED_MIN,
+                AFK_HEAD_SPEED_MAX,
+                DEFAULT_AFK_HEAD_SPEED
+            )
+
+    end
+
+    imgui.TextUnformatted(
+        "Size sets how far the head turns and how much it"
+    )
+
+    imgui.TextUnformatted(
+        "breathes and sways. Lower is more subtle."
+    )
+
+    imgui.TextUnformatted(
+        "100% is the tuned default for both."
+    )
+
+    if afk_head_size <= 45.0 then
+
+        imgui.TextUnformatted(
+            "At this size the head only hints toward the"
+        )
+
+        imgui.TextUnformatted(
+            "overhead panel and pedestal."
         )
 
     end
@@ -5763,6 +6268,14 @@ logMsg(
         and "AUTOMATIC (idle timer)"
         or "MANUAL (bind AFKCamera/trigger_afk)"
     )
+)
+
+logMsg(
+    "Cockpit head movement: size "
+    .. string.format("%.0f", afk_head_size)
+    .. " % | speed "
+    .. string.format("%.0f", afk_head_speed)
+    .. " %"
 )
 
 logMsg(
