@@ -579,19 +579,142 @@ local mouse_input_detected = false
 
 
 -- ============================================================
--- COCKPIT CAMERA SETTINGS
+-- COCKPIT HEAD REALISM
 -- ============================================================
+--
+-- A real pilot's head does not glide between fixed angles on a
+-- fixed timetable, which is what makes a simple eased
+-- interpolation read as robotic. Four things are modelled here.
+--
+--   1. MUSCLE DYNAMICS
+--      The head is pulled toward the target by a spring and
+--      resisted by a damper instead of following a symmetric
+--      ease curve. A turn starts quickly, decelerates as it
+--      arrives and settles with a slight overshoot. Yaw and
+--      pitch use different stiffness, so the two axes never
+--      arrive in perfect lockstep.
+--
+--   2. IDLE LIFE
+--      Breathing, slow postural sway and micro tremor, so the
+--      head is never perfectly still during a hold.
+--
+--   3. COUPLING
+--      The head tilts into a turn, and because the neck pivot
+--      sits below and behind the eyes, looking around also
+--      translates the eye point slightly.
+--
+--   4. WIND-UP
+--      A brief counter-movement before a large turn, the way a
+--      real head loads against the neck before moving.
+--
+-- Every value below is safe to tune. Set realism = false to get
+-- the plain spring motion with no breathing, sway or tremor.
 
-local cockpit_animation_time = 0.0
+local COCKPIT_HEAD = {
 
--- Lower = slower
-local cockpit_animation_speed = 0.35
+    realism = true,
 
--- Maximum left/right movement
-local cockpit_heading_amplitude = 25.0
+    -- Spring frequency in Hz and damping ratio. Higher
+    -- frequency is snappier. Damping below 1.0 overshoots
+    -- slightly and settles back, which is what a head does.
+    spring_frequency = 0.85,
+    spring_damping = 0.72,
 
--- Maximum up/down movement
-local cockpit_pitch_amplitude = 5.0
+    -- Neck pitch muscles are slower than yaw.
+    pitch_spring_scale = 0.86,
+
+    -- Counter-movement before a turn, as a fraction of the
+    -- turn size. 0 disables it.
+    windup = 0.12,
+
+    -- Head tilt into a turn, degrees of roll per degree/second
+    -- of yaw, and the most tilt allowed. Negate roll_coupling
+    -- to tilt the other way.
+    roll_coupling = 0.055,
+    roll_coupling_max = 2.2,
+
+    -- Neck pivot: the eyes sit this far above and forward of
+    -- the point the head actually rotates about (metres).
+    neck_up = 0.11,
+    neck_forward = 0.05,
+
+    -- Breathing: rate in Hz, vertical travel in metres, and
+    -- the small pitch nod that goes with it in degrees.
+    breath_rate = 0.23,
+    breath_y = 0.0035,
+    breath_pitch = 0.14,
+
+    -- Slow postural sway, in degrees and metres.
+    drift_psi = 0.55,
+    drift_the = 0.38,
+    drift_phi = 0.42,
+    drift_pos = 0.0045,
+
+    -- Micro tremor, in degrees.
+    tremor = 0.035,
+
+    -- Seconds for the idle-life layer to fade up from nothing
+    -- when AFK begins. Without this the breathing, sway and
+    -- tremor all switch on at full amplitude on a single frame,
+    -- which reads as a jolt. 0 disables the fade.
+    life_fade_in = 1.2
+
+}
+
+
+-- Spring state. These hold the "muscle" pose, before any of the
+-- idle-life layers are added on top.
+local cockpit_anim_psi = 0.0
+local cockpit_anim_the = 0.0
+
+local cockpit_anim_psi_velocity = 0.0
+local cockpit_anim_the_velocity = 0.0
+
+-- 0 at AFK entry, ramping to 1 over COCKPIT_HEAD.life_fade_in.
+-- Scales every idle-life layer.
+local cockpit_life_blend = 0.0
+
+
+-- ------------------------------------------------------------
+-- IDLE LIFE NOISE
+-- ------------------------------------------------------------
+--
+-- Summing sine waves whose frequencies share no common multiple
+-- gives smooth motion that never audibly repeats, at a fraction
+-- of the cost of real noise. Phases are randomised at load, so
+-- two sessions never drift identically.
+
+local cockpit_noise_time = 0.0
+
+local cockpit_noise_phase = {}
+
+for i = 1, 24 do
+
+    cockpit_noise_phase[i] =
+        math.random()
+        * math.pi
+        * 2.0
+
+end
+
+
+local function cockpit_wave(t, f1, f2, f3, phase_index)
+
+    return
+        math.sin(
+            t * f1
+            + cockpit_noise_phase[phase_index]
+        ) * 0.55
+        + math.sin(
+            t * f2
+            + cockpit_noise_phase[phase_index + 1]
+        ) * 0.31
+        + math.sin(
+            t * f3
+            + cockpit_noise_phase[phase_index + 2]
+        ) * 0.14
+
+end
 
 
 -- ============================================================
@@ -1896,12 +2019,25 @@ local COCKPIT_RETURN_TIME = 0.75
 local cockpit_return_active = false
 local cockpit_return_time = 0.0
 
-local cockpit_return_start_heading = 0.0
-local cockpit_return_start_pitch = 0.0
+-- The pose the return animation starts from. All six channels
+-- are captured, so leaving AFK mid-breath or mid-tilt cannot
+-- pop the view.
+local cockpit_return_start_psi = 0.0
+local cockpit_return_start_the = 0.0
+local cockpit_return_start_phi = 0.0
+local cockpit_return_start_x = 0.0
+local cockpit_return_start_y = 0.0
+local cockpit_return_start_z = 0.0
 
--- Last head heading/pitch the director actually wrote.
-local cockpit_current_heading = 0.0
-local cockpit_current_pitch = 0.0
+-- Exactly what was written to the head last frame. Angles are
+-- absolute; x/y/z are offsets from the pose captured at AFK
+-- entry.
+local cockpit_displayed_psi = 0.0
+local cockpit_displayed_the = 0.0
+local cockpit_displayed_phi = 0.0
+local cockpit_displayed_x = 0.0
+local cockpit_displayed_y = 0.0
+local cockpit_displayed_z = 0.0
 
 
 -- ============================================================
@@ -2073,10 +2209,10 @@ local cockpit_shot_time = 0.0
 
 local cockpit_shot_duration = 2.5
 
-local cockpit_start_heading = 0.0
+-- Where the spring is currently pulling the head. There is no
+-- matching "start" angle any more: the spring carries whatever
+-- pose the head happens to be in when a new target is set.
 local cockpit_target_heading = 0.0
-
-local cockpit_start_pitch = 0.0
 local cockpit_target_pitch = 0.0
 
 
@@ -2129,6 +2265,9 @@ end
 -- START NEW COCKPIT SHOT
 -- ============================================================
 
+-- Passing nil for duration lets the move time be derived from
+-- how far the head actually has to travel, so a short glance
+-- does not take as long as a full shoulder check.
 function cockpit_set_shot(
     shot_name,
     target_heading,
@@ -2141,20 +2280,52 @@ function cockpit_set_shot(
 
     cockpit_shot_time = 0.0
 
+
+    local delta_heading =
+        target_heading
+        - cockpit_target_heading
+
+    local delta_pitch =
+        target_pitch
+        - cockpit_target_pitch
+
+
+    if duration == nil then
+
+        duration =
+            cockpit_estimate_move_time(
+                delta_heading,
+                delta_pitch
+            )
+
+    end
+
     cockpit_shot_duration =
         duration
-
-    cockpit_start_heading =
-        cockpit_target_heading
-
-    cockpit_start_pitch =
-        cockpit_target_pitch
 
     cockpit_target_heading =
         target_heading
 
     cockpit_target_pitch =
         target_pitch
+
+
+    -- WIND-UP
+    -- Kicking the spring velocity backwards produces the brief
+    -- counter-movement a real head makes as it loads against
+    -- the neck before a large turn.
+    if COCKPIT_HEAD.realism
+    and COCKPIT_HEAD.windup > 0 then
+
+        cockpit_anim_psi_velocity =
+            cockpit_anim_psi_velocity
+            - delta_heading * COCKPIT_HEAD.windup
+
+        cockpit_anim_the_velocity =
+            cockpit_anim_the_velocity
+            - delta_pitch * COCKPIT_HEAD.windup
+
+    end
 
 end
 
@@ -2322,6 +2493,204 @@ end
 -- COCKPIT CAMERA CALLBACK
 -- ============================================================
 
+-- ============================================================
+-- COCKPIT SHOT SELECTION
+-- ============================================================
+--
+-- These were previously declared inside the director function,
+-- which rebuilt all six closures on every rendered frame. They
+-- are ordinary module-level functions now.
+
+function cockpit_random_range(min_value, max_value)
+
+    return min_value
+        + math.random()
+        * (max_value - min_value)
+
+end
+
+
+-- How long the pilot dwells before looking somewhere else.
+-- Real dwell times are strongly skewed: mostly short glances,
+-- with the occasional long stare. A flat 5-30 s spread is one
+-- of the things that made the old motion feel mechanical.
+function cockpit_random_hold()
+
+    local roll =
+        math.random()
+
+    if roll < 0.55 then
+
+        -- Quick glance.
+        return cockpit_random_range(1.6, 4.5)
+
+    elseif roll < 0.88 then
+
+        -- Ordinary look.
+        return cockpit_random_range(4.5, 12.0)
+
+    end
+
+    -- Occasional long stare out of the window.
+    return cockpit_random_range(12.0, 28.0)
+
+end
+
+
+function cockpit_random_center_hold()
+
+    return cockpit_random_range(1.2, 4.0)
+
+end
+
+
+-- Roughly how long the spring needs to carry the head across a
+-- given angular distance and settle, so the shot state machine
+-- changes state about when the head actually arrives.
+function cockpit_estimate_move_time(delta_heading, delta_pitch)
+
+    local distance =
+        math.sqrt(
+            delta_heading * delta_heading
+            + delta_pitch * delta_pitch
+        )
+
+    local move_time =
+        0.55
+        + distance * 0.022
+
+    -- Nobody moves at exactly the same speed twice.
+    move_time =
+        move_time
+        * cockpit_random_range(0.88, 1.15)
+
+    if move_time < 0.45 then
+        move_time = 0.45
+    end
+
+    if move_time > 2.4 then
+        move_time = 2.4
+    end
+
+    return move_time
+
+end
+
+
+-- Every look carries a little movement on the other axis too.
+-- Purely horizontal or purely vertical head turns look wrong.
+function cockpit_start_random_shot()
+
+    local choice
+
+    repeat
+        choice = math.random(1, 5)
+    until choice ~= cockpit_last_random_choice
+
+    cockpit_last_random_choice = choice
+
+
+    if choice == 1 then
+
+        -- LOOK LEFT
+
+        cockpit_set_shot(
+            "LOOK LEFT",
+
+            cockpit_base_head_psi
+            - cockpit_random_range(20.0, 30.0),
+
+            cockpit_base_head_the
+            + cockpit_random_range(-3.5, 2.0),
+
+            nil
+        )
+
+
+    elseif choice == 2 then
+
+        -- LOOK RIGHT
+
+        cockpit_set_shot(
+            "LOOK RIGHT",
+
+            cockpit_base_head_psi
+            + cockpit_random_range(20.0, 30.0),
+
+            cockpit_base_head_the
+            + cockpit_random_range(-3.5, 2.0),
+
+            nil
+        )
+
+
+    elseif choice == 3 then
+
+        -- LOOK DOWN
+
+        cockpit_set_shot(
+            "LOOK DOWN",
+
+            cockpit_base_head_psi
+            + cockpit_random_range(-4.0, 4.0),
+
+            cockpit_base_head_the
+            - cockpit_random_range(8.0, 14.0),
+
+            nil
+        )
+
+
+    elseif choice == 4 then
+
+        -- LEFT INSTRUMENT PANEL
+
+        cockpit_set_shot(
+            "LOOK PANEL LEFT",
+
+            cockpit_base_head_psi
+            - cockpit_random_range(11.0, 19.0),
+
+            cockpit_base_head_the
+            - cockpit_random_range(5.5, 10.5),
+
+            nil
+        )
+
+
+    else
+
+        -- RIGHT INSTRUMENT PANEL
+
+        cockpit_set_shot(
+            "LOOK PANEL RIGHT",
+
+            cockpit_base_head_psi
+            + cockpit_random_range(11.0, 19.0),
+
+            cockpit_base_head_the
+            - cockpit_random_range(5.5, 10.5),
+
+            nil
+        )
+
+    end
+
+end
+
+
+function cockpit_return_to_center()
+
+    cockpit_set_shot(
+        "CENTER HOLD",
+        cockpit_base_head_psi,
+        cockpit_base_head_the,
+        cockpit_random_center_hold()
+    )
+
+end
+
+
 function cockpit_director_update(delta_time)
 
     if not afk_active then
@@ -2350,173 +2719,6 @@ function cockpit_director_update(delta_time)
     -- ----------------------------------------------------
     -- Change shot
     -- ----------------------------------------------------
-
-            function cockpit_random_range(min_value, max_value)
-
-    return min_value
-        + math.random()
-        * (max_value - min_value)
-
-end
-
-
-function cockpit_random_hold()
-
-    return cockpit_random_range(
-        5.0,
-        30.0
-    )
-
-end
-
-
-function cockpit_random_move()
-
-    return cockpit_random_range(
-        2.2,
-        3.0
-    )
-
-end
-
-
-   function cockpit_start_random_shot()
-
-    local choice
-
-    repeat
-        choice = math.random(1, 5)
-    until choice ~= cockpit_last_random_choice
-
-    cockpit_last_random_choice = choice
-
-
-    if choice == 1 then
-
-        -- LOOK LEFT
-
-        local angle =
-            cockpit_random_range(20.0, 28.0)
-
-        cockpit_set_shot(
-            "LOOK LEFT",
-
-            cockpit_base_head_psi
-            - angle,
-
-            cockpit_base_head_the,
-
-            cockpit_random_move()
-        )
-
-
-    elseif choice == 2 then
-
-        -- LOOK RIGHT
-
-        local angle =
-            cockpit_random_range(20.0, 28.0)
-
-        cockpit_set_shot(
-            "LOOK RIGHT",
-
-            cockpit_base_head_psi
-            + angle,
-
-            cockpit_base_head_the,
-
-            cockpit_random_move()
-        )
-
-
-    elseif choice == 3 then
-
-        -- LOOK DOWN
-
-        local angle =
-            cockpit_random_range(8.0, 13.0)
-
-        cockpit_set_shot(
-            "LOOK DOWN",
-
-            cockpit_base_head_psi,
-
-            cockpit_base_head_the
-            - angle,
-
-            cockpit_random_move()
-        )
-
-
-    elseif choice == 4 then
-
-        -- LEFT INSTRUMENT PANEL
-
-        local heading_angle =
-            cockpit_random_range(12.0, 18.0)
-
-        local pitch_angle =
-            cockpit_random_range(6.0, 10.0)
-
-        cockpit_set_shot(
-            "LOOK PANEL LEFT",
-
-            cockpit_base_head_psi
-            - heading_angle,
-
-            cockpit_base_head_the
-            - pitch_angle,
-
-            cockpit_random_move()
-        )
-
-
-    elseif choice == 5 then
-
-        -- RIGHT INSTRUMENT PANEL
-
-        local heading_angle =
-            cockpit_random_range(12.0, 18.0)
-
-        local pitch_angle =
-            cockpit_random_range(6.0, 10.0)
-
-        cockpit_set_shot(
-            "LOOK PANEL RIGHT",
-
-            cockpit_base_head_psi
-            + heading_angle,
-
-            cockpit_base_head_the
-            - pitch_angle,
-
-            cockpit_random_move()
-        )
-
-    end
-
-end
-
-    function cockpit_random_center_hold()
-
-        return cockpit_random_range(
-            1.5,
-            3.5
-        )
-
-    end
-
-
-    function cockpit_return_to_center()
-
-        cockpit_set_shot(
-            "CENTER HOLD",
-            cockpit_base_head_psi,
-            cockpit_base_head_the,
-            cockpit_random_center_hold()
-        )
-
-    end
 
     if cockpit_shot_time >= cockpit_shot_duration then
 
@@ -2548,7 +2750,7 @@ end
                 "RETURN CENTER LEFT",
                 cockpit_base_head_psi,
                 cockpit_base_head_the,
-                COCKPIT_MOVE_TIME
+                nil
             )
 
 
@@ -2572,7 +2774,7 @@ end
                 "RETURN CENTER RIGHT",
                 cockpit_base_head_psi,
                 cockpit_base_head_the,
-                COCKPIT_MOVE_TIME
+                nil
             )
 
 
@@ -2596,7 +2798,7 @@ end
                 "RETURN CENTER DOWN",
                 cockpit_base_head_psi,
                 cockpit_base_head_the,
-                COCKPIT_MOVE_TIME
+                nil
             )
 
 
@@ -2620,7 +2822,7 @@ end
                 "RETURN CENTER PANEL LEFT",
                 cockpit_base_head_psi,
                 cockpit_base_head_the,
-                COCKPIT_MOVE_TIME
+                nil
             )
 
 
@@ -2644,7 +2846,7 @@ end
                 "RETURN CENTER PANEL RIGHT",
                 cockpit_base_head_psi,
                 cockpit_base_head_the,
-                COCKPIT_MOVE_TIME
+                nil
             )
 
 
@@ -2670,69 +2872,305 @@ end
     end
     
         -- ----------------------------------------------------
-        -- Calculate transition
+        -- MUSCLE DYNAMICS
+        -- ----------------------------------------------------
+        --
+        -- Sub-stepping keeps the spring stable if the frame rate
+        -- drops or the spring is tuned much stiffer.
+
+        local steps =
+            math.ceil(delta_time / 0.02)
+
+        if steps < 1 then
+            steps = 1
+        end
+
+        if steps > 8 then
+            steps = 8
+        end
+
+        local step_time =
+            delta_time / steps
+
+        local omega_psi =
+            2.0
+            * math.pi
+            * COCKPIT_HEAD.spring_frequency
+
+        local omega_the =
+            omega_psi
+            * COCKPIT_HEAD.pitch_spring_scale
+
+
+        for step = 1, steps do
+
+            local psi_accel =
+                omega_psi
+                * omega_psi
+                * (
+                    cockpit_target_heading
+                    - cockpit_anim_psi
+                )
+                - 2.0
+                * COCKPIT_HEAD.spring_damping
+                * omega_psi
+                * cockpit_anim_psi_velocity
+
+            cockpit_anim_psi_velocity =
+                cockpit_anim_psi_velocity
+                + psi_accel * step_time
+
+            cockpit_anim_psi =
+                cockpit_anim_psi
+                + cockpit_anim_psi_velocity * step_time
+
+
+            local the_accel =
+                omega_the
+                * omega_the
+                * (
+                    cockpit_target_pitch
+                    - cockpit_anim_the
+                )
+                - 2.0
+                * COCKPIT_HEAD.spring_damping
+                * omega_the
+                * cockpit_anim_the_velocity
+
+            cockpit_anim_the_velocity =
+                cockpit_anim_the_velocity
+                + the_accel * step_time
+
+            cockpit_anim_the =
+                cockpit_anim_the
+                + cockpit_anim_the_velocity * step_time
+
+        end
+
+
+        -- ----------------------------------------------------
+        -- IDLE LIFE
         -- ----------------------------------------------------
 
-        local progress =
-            cockpit_shot_time
-            / cockpit_shot_duration
+        local psi_out =
+            cockpit_anim_psi
+
+        local the_out =
+            cockpit_anim_the
+
+        local phi_out =
+            cockpit_base_head_phi
+
+        local offset_x = 0.0
+        local offset_y = 0.0
+        local offset_z = 0.0
 
 
-        if progress > 1 then
-            progress = 1
+        if COCKPIT_HEAD.realism then
+
+            cockpit_noise_time =
+                cockpit_noise_time
+                + delta_time
+
+            local t =
+                cockpit_noise_time
+
+
+            -- ------------------------------------------------
+            -- FADE IN
+            -- ------------------------------------------------
+            --
+            -- Every wave below is a sine with a randomised
+            -- phase, so on the first AFK frame it evaluates to
+            -- an arbitrary point in its cycle rather than to
+            -- zero. Applied at full amplitude that arrives as a
+            -- single visible step the instant AFK begins.
+            --
+            -- Ramping the whole layer up from nothing fixes it.
+            -- Smoothstep means the rate of change starts at
+            -- zero as well, so the head comes alive gradually
+            -- instead of switching on.
+
+            if cockpit_life_blend < 1.0 then
+
+                if COCKPIT_HEAD.life_fade_in > 0 then
+
+                    cockpit_life_blend =
+                        cockpit_life_blend
+                        + delta_time
+                        / COCKPIT_HEAD.life_fade_in
+
+                else
+
+                    cockpit_life_blend =
+                        1.0
+
+                end
+
+                if cockpit_life_blend > 1.0 then
+                    cockpit_life_blend = 1.0
+                end
+
+            end
+
+            local life =
+                cockpit_smoothstep(
+                    cockpit_life_blend
+                )
+
+
+            -- Slow postural sway.
+            psi_out =
+                psi_out
+                + cockpit_wave(t, 0.41, 0.67, 1.13, 1)
+                * COCKPIT_HEAD.drift_psi
+                * life
+
+            the_out =
+                the_out
+                + cockpit_wave(t, 0.37, 0.71, 1.07, 4)
+                * COCKPIT_HEAD.drift_the
+                * life
+
+            phi_out =
+                phi_out
+                + cockpit_wave(t, 0.29, 0.53, 0.97, 7)
+                * COCKPIT_HEAD.drift_phi
+                * life
+
+            offset_x =
+                offset_x
+                + cockpit_wave(t, 0.31, 0.59, 0.83, 10)
+                * COCKPIT_HEAD.drift_pos
+                * life
+
+            offset_z =
+                offset_z
+                + cockpit_wave(t, 0.27, 0.61, 0.89, 13)
+                * COCKPIT_HEAD.drift_pos
+                * life
+
+
+            -- Micro tremor: far too small to see as motion,
+            -- but it stops the image from ever locking solid.
+            psi_out =
+                psi_out
+                + math.sin(
+                    t * 7.3
+                    + cockpit_noise_phase[16]
+                )
+                * COCKPIT_HEAD.tremor
+                * life
+
+            the_out =
+                the_out
+                + math.sin(
+                    t * 9.1
+                    + cockpit_noise_phase[17]
+                )
+                * COCKPIT_HEAD.tremor
+                * life
+
+
+            -- Breathing.
+            local breath =
+                math.sin(
+                    t
+                    * 2.0
+                    * math.pi
+                    * COCKPIT_HEAD.breath_rate
+                    + cockpit_noise_phase[18]
+                )
+                * life
+
+            offset_y =
+                offset_y
+                + breath * COCKPIT_HEAD.breath_y
+
+            the_out =
+                the_out
+                + breath * COCKPIT_HEAD.breath_pitch
+
+
+            -- Tilt into the turn, driven by how fast the head
+            -- is actually yawing, so it appears during a move
+            -- and vanishes on a hold by itself.
+            local roll_couple =
+                cockpit_anim_psi_velocity
+                * COCKPIT_HEAD.roll_coupling
+
+            if roll_couple > COCKPIT_HEAD.roll_coupling_max then
+                roll_couple = COCKPIT_HEAD.roll_coupling_max
+            end
+
+            if roll_couple < -COCKPIT_HEAD.roll_coupling_max then
+                roll_couple = -COCKPIT_HEAD.roll_coupling_max
+            end
+
+            phi_out =
+                phi_out
+                + roll_couple
+
+
+            -- ------------------------------------------------
+            -- NECK PIVOT
+            -- ------------------------------------------------
+            --
+            -- The eyes are not at the centre of rotation, so
+            -- rotating the head also swings the eye point. The
+            -- rest vector from pivot to eyes is rotated by the
+            -- head angles relative to the AFK entry pose, and
+            -- the difference is the translation.
+            --
+            -- This reuses the transform the exterior camera
+            -- already uses, which follows the same X-Plane
+            -- convention: X right, Y up, Z toward the tail.
+
+            local neck_x,
+                  neck_y,
+                  neck_z =
+                cockpit_aircraft_to_world(
+                    0.0,
+                    COCKPIT_HEAD.neck_up,
+                    -COCKPIT_HEAD.neck_forward,
+                    the_out - cockpit_base_head_the,
+                    phi_out - cockpit_base_head_phi,
+                    psi_out - cockpit_base_head_psi
+                )
+
+            offset_x =
+                offset_x
+                + neck_x
+
+            offset_y =
+                offset_y
+                + neck_y
+                - COCKPIT_HEAD.neck_up
+
+            offset_z =
+                offset_z
+                + neck_z
+                + COCKPIT_HEAD.neck_forward
+
         end
-
-
-        if progress < 0 then
-            progress = 0
-        end
-
-
-        local smooth_progress =
-            cockpit_smoothstep(progress)
-
-
-        local heading =
-            cockpit_start_heading
-            + (
-                cockpit_target_heading
-                - cockpit_start_heading
-            )
-            * smooth_progress
-
-
-        local pitch =
-            cockpit_start_pitch
-            + (
-                cockpit_target_pitch
-                - cockpit_start_pitch
-            )
-            * smooth_progress
 
 
         -- ----------------------------------------------------
         -- X-PLANE NORMAL COCKPIT CAMERA OUTPUT
         -- ----------------------------------------------------
         --
-        -- Write only the pilot-head values. X-Plane itself remains
-        -- responsible for placing the cockpit camera with the
-        -- aircraft. No world-space camera position/orientation is
-        -- calculated here.
-
-        -- Explicitly push the animated head values into X-Plane.
-        -- Using set() here makes the write unambiguous while the
-        -- normal cockpit camera remains under X-Plane/XPRealistic.
+        -- Only the pilot-head values are written. X-Plane itself
+        -- remains responsible for placing the cockpit camera
+        -- with the aircraft.
 
         cockpit_write_head_pose(
-            heading,
-            pitch
+            psi_out,
+            the_out,
+            phi_out,
+            offset_x,
+            offset_y,
+            offset_z
         )
-
-        cockpit_current_heading =
-            heading
-
-        cockpit_current_pitch =
-            pitch
 
 end
 
@@ -2741,41 +3179,62 @@ end
 -- PILOT HEAD WRITER
 -- ============================================================
 --
--- Position and roll always come from the pose captured at AFK
--- entry; only heading/pitch are animated. Aircraft bank remains
--- under X-Plane's normal cockpit camera.
+-- The single place the pilot head is written. The angles are
+-- absolute; x/y/z are offsets from the pose captured at AFK
+-- entry. Whatever is written is remembered, so the return
+-- animation can start from the exact displayed pose.
 
-function cockpit_write_head_pose(heading, pitch)
+function cockpit_write_head_pose(
+    psi,
+    the,
+    phi,
+    offset_x,
+    offset_y,
+    offset_z
+)
+
+    offset_x = offset_x or 0.0
+    offset_y = offset_y or 0.0
+    offset_z = offset_z or 0.0
+
 
     set(
         "sim/graphics/view/pilots_head_x",
-        cockpit_base_head_x
+        cockpit_base_head_x + offset_x
     )
 
     set(
         "sim/graphics/view/pilots_head_y",
-        cockpit_base_head_y
+        cockpit_base_head_y + offset_y
     )
 
     set(
         "sim/graphics/view/pilots_head_z",
-        cockpit_base_head_z
+        cockpit_base_head_z + offset_z
     )
 
     set(
         "sim/graphics/view/pilots_head_psi",
-        heading
+        psi
     )
 
     set(
         "sim/graphics/view/pilots_head_the",
-        pitch
+        the
     )
 
     set(
         "sim/graphics/view/pilots_head_phi",
-        cockpit_base_head_phi
+        phi
     )
+
+
+    cockpit_displayed_psi = psi
+    cockpit_displayed_the = the
+    cockpit_displayed_phi = phi
+    cockpit_displayed_x = offset_x
+    cockpit_displayed_y = offset_y
+    cockpit_displayed_z = offset_z
 
 end
 
@@ -2786,14 +3245,12 @@ function cockpit_restore_head_pose()
 
     cockpit_write_head_pose(
         cockpit_base_head_psi,
-        cockpit_base_head_the
+        cockpit_base_head_the,
+        cockpit_base_head_phi,
+        0.0,
+        0.0,
+        0.0
     )
-
-    cockpit_current_heading =
-        cockpit_base_head_psi
-
-    cockpit_current_pitch =
-        cockpit_base_head_the
 
     cockpit_return_active =
         false
@@ -2806,6 +3263,12 @@ end
 
 -- Runs every frame from the main loop, whether or not AFK is
 -- active, until the head is back at the pre-AFK pose.
+--
+-- All six channels ease out together, from whatever was on
+-- screen the instant AFK ended. The idle-life layers are not
+-- re-applied here: they are already baked into the starting
+-- pose and fade out with it, so the head settles rather than
+-- twitching on the way home.
 function cockpit_return_update(delta_time)
 
     if not cockpit_return_active then
@@ -2841,35 +3304,35 @@ function cockpit_return_update(delta_time)
 
     end
 
-    local smooth_progress =
+    local blend =
         cockpit_smoothstep(progress)
 
-    local heading =
-        cockpit_return_start_heading
-        + (
-            cockpit_base_head_psi
-            - cockpit_return_start_heading
-        )
-        * smooth_progress
-
-    local pitch =
-        cockpit_return_start_pitch
-        + (
-            cockpit_base_head_the
-            - cockpit_return_start_pitch
-        )
-        * smooth_progress
+    local remaining =
+        1.0 - blend
 
     cockpit_write_head_pose(
-        heading,
-        pitch
+        cockpit_return_start_psi
+        + (
+            cockpit_base_head_psi
+            - cockpit_return_start_psi
+        ) * blend,
+
+        cockpit_return_start_the
+        + (
+            cockpit_base_head_the
+            - cockpit_return_start_the
+        ) * blend,
+
+        cockpit_return_start_phi
+        + (
+            cockpit_base_head_phi
+            - cockpit_return_start_phi
+        ) * blend,
+
+        cockpit_return_start_x * remaining,
+        cockpit_return_start_y * remaining,
+        cockpit_return_start_z * remaining
     )
-
-    cockpit_current_heading =
-        heading
-
-    cockpit_current_pitch =
-        pitch
 
 end
 
@@ -2888,12 +3351,20 @@ function start_cockpit_camera()
 
         -- Still animating back from the previous AFK session.
         -- The head is not at the user's pose yet, so keep the
-        -- base captured last time instead of re-capturing.
+        -- base captured last time instead of re-capturing, and
+        -- start the spring from what is currently on screen so
+        -- the interrupted return does not jump.
         cockpit_return_active =
             false
 
         cockpit_return_time =
             0.0
+
+        cockpit_anim_psi =
+            cockpit_displayed_psi
+
+        cockpit_anim_the =
+            cockpit_displayed_the
 
     else
 
@@ -2916,26 +3387,47 @@ function start_cockpit_camera()
         cockpit_base_head_phi =
             tonumber(afk_pilot_head_phi) or 0.0
 
+        cockpit_anim_psi =
+            cockpit_base_head_psi
+
+        cockpit_anim_the =
+            cockpit_base_head_the
+
     end
 
-    cockpit_current_heading =
-        cockpit_base_head_psi
 
-    cockpit_current_pitch =
-        cockpit_base_head_the
+    cockpit_anim_psi_velocity =
+        0.0
+
+    cockpit_anim_the_velocity =
+        0.0
+
+    -- Breathing, sway and tremor all start from nothing, so
+    -- entering AFK does not land as a step. The roll coupling
+    -- needs no fade: it is driven by spring velocity, which is
+    -- zero here by definition.
+    cockpit_life_blend =
+        0.0
+
+    cockpit_displayed_psi =
+        cockpit_anim_psi
+
+    cockpit_displayed_the =
+        cockpit_anim_the
+
+    cockpit_displayed_phi =
+        cockpit_base_head_phi
+
+    cockpit_displayed_x = 0.0
+    cockpit_displayed_y = 0.0
+    cockpit_displayed_z = 0.0
 
 
     cockpit_camera_controlled = true
 
 
-    -- Start the scripted animation from the exact current
-    -- pilot-head orientation.
-    cockpit_start_heading =
-        cockpit_base_head_psi
-
-    cockpit_start_pitch =
-        cockpit_base_head_the
-
+    -- The spring starts pulling toward the pose the user left
+    -- the head in.
     cockpit_target_heading =
         cockpit_base_head_psi
 
@@ -3020,11 +3512,47 @@ function stop_cockpit_camera(immediate)
     cockpit_return_time =
         0.0
 
-    cockpit_return_start_heading =
-        cockpit_current_heading
+    cockpit_return_start_psi =
+        cockpit_displayed_psi
 
-    cockpit_return_start_pitch =
-        cockpit_current_pitch
+    cockpit_return_start_the =
+        cockpit_displayed_the
+
+    cockpit_return_start_phi =
+        cockpit_displayed_phi
+
+    cockpit_return_start_x =
+        cockpit_displayed_x
+
+    cockpit_return_start_y =
+        cockpit_displayed_y
+
+    cockpit_return_start_z =
+        cockpit_displayed_z
+
+
+    -- HOLD THE POSE FOR THIS FRAME
+    --
+    -- cockpit_return_update() already ran earlier in this frame,
+    -- before the activity handler noticed the input, and that
+    -- handler returns from the frame loop before the director
+    -- would run. Without this write the pilot head goes unwritten
+    -- for exactly one frame, so whatever else owns those DataRefs
+    -- (XPRealistic, X-Plane's own view code) shows through for a
+    -- single frame before the return animation snaps the head
+    -- back and glides it home.
+    --
+    -- Re-writing the pose that is already on screen makes the
+    -- exit frame identical to the frame before it.
+    cockpit_write_head_pose(
+        cockpit_return_start_psi,
+        cockpit_return_start_the,
+        cockpit_return_start_phi,
+        cockpit_return_start_x,
+        cockpit_return_start_y,
+        cockpit_return_start_z
+    )
+
 
     logMsg(
         "AFK CAMERA: "
