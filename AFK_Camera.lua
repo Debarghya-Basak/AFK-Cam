@@ -5410,8 +5410,8 @@ function afk_settings_show_wnd()
 
     afk_settings_wnd =
         float_wnd_create(
-            470,
-            740,
+            480,
+            720,
             1,
             true
         )
@@ -5478,22 +5478,54 @@ function afk_settings_on_close(wnd)
 end
 
 
+-- ============================================================
+-- SETTINGS PANEL LAYOUT
+-- ============================================================
+--
+-- Grouped so the panel can be read rather than scanned: each
+-- block is one heading, its controls, and at most a couple of
+-- lines saying what they do. Separators mark the boundaries.
+--
+--   1  ON / OFF and what the camera is doing right now
+--   2  HOW AFK STARTS   entry mode, timer, manual bind
+--   3  COCKPIT VIEW     head movement size and speed
+--   4  WAKE-UP INPUTS   what ends AFK
+--   5  DISPLAY          debug HUD
+--   6  Save / Restore / Close
+--
+-- Only imgui calls already proven to work in this FlyWithLua
+-- build are used here: TextUnformatted, Separator, Checkbox,
+-- SliderFloat, Button and SameLine. A call this build does not
+-- bind would throw every frame the window is open, so tabs and
+-- collapsing headers are deliberately avoided.
+
+function afk_settings_group(title)
+
+    imgui.TextUnformatted("")
+    imgui.Separator()
+    imgui.TextUnformatted("")
+    imgui.TextUnformatted(title)
+    imgui.TextUnformatted("")
+
+end
+
+
 function afk_settings_on_build(wnd, x, y)
 
+    -- --------------------------------------------------------
+    -- 1. ON / OFF AND CURRENT STATE
+    -- --------------------------------------------------------
+
     imgui.TextUnformatted(
-        "AFK Camera"
+        "AFK CAMERA"
     )
 
     imgui.TextUnformatted(
         "Automatic cinematic camera after inactivity."
     )
 
-    imgui.Separator()
+    imgui.TextUnformatted("")
 
-
-    -- --------------------------------------------------------
-    -- ENABLE / DISABLE
-    -- --------------------------------------------------------
 
     local changed, new_enabled =
         imgui.Checkbox(
@@ -5558,16 +5590,29 @@ function afk_settings_on_build(wnd, x, y)
     end
 
 
-    imgui.TextUnformatted("")
-
-
-    -- --------------------------------------------------------
-    -- HOW AFK STARTS
-    -- --------------------------------------------------------
-
     imgui.TextUnformatted(
-        "AFK entry"
+        "Status: "
+        .. (
+            afk_enabled
+            and (
+                afk_active
+                and "AFK"
+                or "ACTIVE"
+            )
+            or "DISABLED"
+        )
+        .. "    Last input: "
+        .. tostring(
+            last_activity
+        )
     )
+
+
+    -- --------------------------------------------------------
+    -- 2. HOW AFK STARTS
+    -- --------------------------------------------------------
+
+    afk_settings_group("HOW AFK STARTS")
 
     local auto_changed, new_auto_entry =
         imgui.Checkbox(
@@ -5594,53 +5639,6 @@ function afk_settings_on_build(wnd, x, y)
 
     end
 
-    if afk_auto_entry then
-
-        imgui.TextUnformatted(
-            "AFK starts on its own when the timer runs out."
-        )
-
-    else
-
-        imgui.TextUnformatted(
-            "AFK starts only when you press the bound control."
-        )
-
-    end
-
-    imgui.TextUnformatted("")
-
-    imgui.TextUnformatted(
-        "Bind any key, mouse or joystick button to:"
-    )
-
-    imgui.TextUnformatted(
-        "    AFK Camera: start/stop AFK now"
-    )
-
-    imgui.TextUnformatted(
-        "X-Plane > Settings > Keyboard or Joystick,"
-    )
-
-    imgui.TextUnformatted(
-        "then search for AFK. The same control stops AFK."
-    )
-
-    imgui.TextUnformatted(
-        "It works in automatic mode too, as a shortcut."
-    )
-
-
-    imgui.TextUnformatted("")
-
-
-    -- --------------------------------------------------------
-    -- AFK TIMER
-    -- --------------------------------------------------------
-
-    imgui.TextUnformatted(
-        "AFK Timer"
-    )
 
     local timeout_changed, new_timeout =
         imgui.SliderFloat(
@@ -5664,18 +5662,18 @@ function afk_settings_on_build(wnd, x, y)
     if afk_auto_entry then
 
         imgui.TextUnformatted(
-            "Current timer: "
+            "AFK starts on its own after "
             .. string.format(
                 "%.0f",
                 AFK_TIMEOUT
             )
-            .. " seconds"
+            .. " seconds idle."
         )
 
     else
 
         imgui.TextUnformatted(
-            "Not used while AFK entry is manual."
+            "Manual only. The timer above is not used."
         )
 
     end
@@ -5683,14 +5681,28 @@ function afk_settings_on_build(wnd, x, y)
 
     imgui.TextUnformatted("")
 
-
-    -- --------------------------------------------------------
-    -- COCKPIT HEAD MOVEMENT
-    -- --------------------------------------------------------
+    imgui.TextUnformatted(
+        "Manual trigger, works in either mode:"
+    )
 
     imgui.TextUnformatted(
-        "Cockpit head movement"
+        "  bind any key, mouse or joystick button to"
     )
+
+    imgui.TextUnformatted(
+        "  \"AFK Camera: start/stop AFK now\""
+    )
+
+    imgui.TextUnformatted(
+        "  in X-Plane > Settings > Keyboard or Joystick."
+    )
+
+
+    -- --------------------------------------------------------
+    -- 3. COCKPIT VIEW
+    -- --------------------------------------------------------
+
+    afk_settings_group("COCKPIT VIEW")
 
     local size_changed, new_head_size =
         imgui.SliderFloat(
@@ -5735,40 +5747,37 @@ function afk_settings_on_build(wnd, x, y)
     end
 
     imgui.TextUnformatted(
-        "Size sets how far the head turns and how much it"
+        "How far the pilot's head turns, and how"
     )
 
     imgui.TextUnformatted(
-        "breathes and sways. Lower is more subtle."
-    )
-
-    imgui.TextUnformatted(
-        "100% is the tuned default for both."
+        "quickly. 100% is the tuned default."
     )
 
     if afk_head_size <= 45.0 then
 
         imgui.TextUnformatted(
-            "At this size the head only hints toward the"
+            "At this size the head only hints toward"
         )
 
         imgui.TextUnformatted(
-            "overhead panel and pedestal."
+            "the overhead panel and pedestal."
         )
 
     end
 
 
-    imgui.TextUnformatted("")
-
-
     -- --------------------------------------------------------
-    -- WAKE-UP INPUTS
+    -- 4. WAKE-UP INPUTS
     -- --------------------------------------------------------
+
+    afk_settings_group("WAKE-UP INPUTS")
 
     imgui.TextUnformatted(
-        "Wake-up inputs"
+        "Keys, buttons and joystick axes always end AFK."
     )
+
+    imgui.TextUnformatted("")
 
     local mouse_move_changed, new_mouse_move =
         imgui.Checkbox(
@@ -5804,20 +5813,19 @@ function afk_settings_on_build(wnd, x, y)
     if deadzone_changed then
 
         afk_joystick_deadzone =
-            clamp_afk_joystick_deadzone(
-                new_deadzone
+            clamp_afk_percent(
+                new_deadzone,
+                AFK_JOYSTICK_DEADZONE_MIN,
+                AFK_JOYSTICK_DEADZONE_MAX,
+                DEFAULT_AFK_JOYSTICK_DEADZONE
             )
 
     end
 
+    -- Live jitter readout. Leave the stick alone and set the
+    -- dead zone just above the number shown here.
     imgui.TextUnformatted(
-        "Axis changes below the dead zone are ignored."
-    )
-
-    -- Live jitter readout: leave the stick alone and set the
-    -- dead zone a little above the number shown here.
-    imgui.TextUnformatted(
-        "Largest axis change right now: "
+        "Axis movement right now: "
         .. string.format(
             "%.2f",
             joystick_last_max_difference
@@ -5826,13 +5834,20 @@ function afk_settings_on_build(wnd, x, y)
         .. " %"
     )
 
+    imgui.TextUnformatted(
+        "Set the dead zone just above that number so"
+    )
 
-    imgui.TextUnformatted("")
+    imgui.TextUnformatted(
+        "an idle stick's jitter does not end AFK."
+    )
 
 
     -- --------------------------------------------------------
-    -- DEBUG HUD
+    -- 5. DISPLAY
     -- --------------------------------------------------------
+
+    afk_settings_group("DISPLAY")
 
     local debug_changed, new_debug_visible =
         imgui.Checkbox(
@@ -5849,40 +5864,13 @@ function afk_settings_on_build(wnd, x, y)
     end
 
 
-    imgui.Separator()
-
-
     -- --------------------------------------------------------
-    -- CURRENT STATE
+    -- 6. SAVE / RESTORE / CLOSE
     -- --------------------------------------------------------
-
-    imgui.TextUnformatted(
-        "Status: "
-        .. (
-            afk_enabled
-            and (
-                afk_active
-                and "AFK"
-                or "ACTIVE"
-            )
-            or "DISABLED"
-        )
-    )
-
-    imgui.TextUnformatted(
-        "Last activity: "
-        .. tostring(
-            last_activity
-        )
-    )
-
 
     imgui.TextUnformatted("")
-
-
-    -- --------------------------------------------------------
-    -- SAVE
-    -- --------------------------------------------------------
+    imgui.Separator()
+    imgui.TextUnformatted("")
 
     if imgui.Button(
         "Save Settings",
