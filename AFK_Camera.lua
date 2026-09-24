@@ -6,6 +6,22 @@
 
 
 -- ============================================================
+-- VERSION
+-- ============================================================
+--
+-- Bump this when releasing. The update check compares it with
+-- the latest version on afkcamera.vercel.app, and it is shown
+-- in the settings window and written to the log.
+--
+-- Format is one decimal: "1.0", "1.1", "1.2" ... After "1.9"
+-- go to "2.0". The part after the dot is read as a whole
+-- number, so "1.10" would count as newer than "1.9", not as
+-- the same as "1.1".
+
+local AFK_CAMERA_VERSION = "1.2"
+
+
+-- ============================================================
 -- SETTINGS
 -- ============================================================
 
@@ -1434,6 +1450,152 @@ void XPLMUnregisterCommandHandler(
 local afk_view_command_refs = {}
 
 local afk_view_command_callback
+
+-- ============================================================
+-- UPDATE CHECK
+-- ============================================================
+--
+-- The installed version, AFK_CAMERA_VERSION, is set at the
+-- top of the file.
+
+-- Everything the update check needs, in one table so it costs
+-- a single Lua local. This file is close to the 200 local
+-- limit the language imposes on a chunk.
+--
+-- The check reads the site's version endpoint, which serves
+-- just the current release:
+--
+--     {
+--       "version": "1.1.0",
+--       "summary": "Realism improved",
+--       "downloadPage": "https://afkcamera.vercel.app/download",
+--       "latestRelease": "https://github.com/.../releases/latest",
+--       ...
+--     }
+--
+-- Only "version" is needed; everything else is optional and
+-- anything unrecognised is ignored, so the endpoint can grow
+-- without breaking copies of this script already in the wild.
+--
+-- The whole-array changelog is still understood as well. If
+-- the address is ever pointed back at a releases.json, the
+-- entry flagged "latest": true wins, falling back to the first
+-- entry since that list runs newest first.
+
+local AFK_UPDATE = {
+
+    url = "https://afkcamera.vercel.app/api/version.json",
+
+    -- Fallback link, used only if the endpoint names none.
+    page = "https://afkcamera.vercel.app",
+
+    -- Written to the system temp directory rather than the
+    -- script folder, which is read-only when X-Plane is
+    -- installed under Program Files.
+    file =
+        (
+            os.getenv("TEMP")
+            or os.getenv("TMP")
+            or SCRIPT_DIRECTORY
+        )
+        .. "/AFKCamera_update.txt",
+
+    -- Seconds before the check is called off. curl is given a
+    -- shorter limit of its own, so this only matters if curl
+    -- never runs at all.
+    timeout = 15.0,
+
+    -- "idle", "checking", "current", "available" or "failed".
+    state = "idle",
+
+    message = "",
+    latest = "",
+
+    -- Where to get the new version, taken from the endpoint.
+    download = "",
+
+    started = 0.0,
+    next_poll = 0.0,
+
+    -- Size of the response the last poll saw. Used to tell a
+    -- half-written file from a finished one.
+    last_size = -1
+
+}
+
+
+-- Used to start curl without a console window. X-Plane is a
+-- full-screen application and may be in VR; a console flashing
+-- up over it is not acceptable, which rules out os.execute and
+-- io.popen.
+--
+-- Kept in AFK_UPDATE rather than its own local: the main chunk
+-- is at the 200 local limit, and going over it stops the whole
+-- script compiling, which FlyWithLua answers with quarantine.
+AFK_UPDATE.kernel32 = ffi.load("kernel32")
+
+ffi.cdef[[
+typedef struct {
+    unsigned long  cb;
+    char *lpReserved;
+    char *lpDesktop;
+    char *lpTitle;
+    unsigned long  dwX;
+    unsigned long  dwY;
+    unsigned long  dwXSize;
+    unsigned long  dwYSize;
+    unsigned long  dwXCountChars;
+    unsigned long  dwYCountChars;
+    unsigned long  dwFillAttribute;
+    unsigned long  dwFlags;
+    unsigned short wShowWindow;
+    unsigned short cbReserved2;
+    unsigned char *lpReserved2;
+    void *hStdInput;
+    void *hStdOutput;
+    void *hStdError;
+} AFK_STARTUPINFOA;
+
+typedef struct {
+    void *hProcess;
+    void *hThread;
+    unsigned long dwProcessId;
+    unsigned long dwThreadId;
+} AFK_PROCESS_INFORMATION;
+
+int CreateProcessA(
+    const char *lpApplicationName,
+    char *lpCommandLine,
+    void *lpProcessAttributes,
+    void *lpThreadAttributes,
+    int bInheritHandles,
+    unsigned long dwCreationFlags,
+    void *lpEnvironment,
+    const char *lpCurrentDirectory,
+    AFK_STARTUPINFOA *lpStartupInfo,
+    AFK_PROCESS_INFORMATION *lpProcessInformation
+);
+
+int CloseHandle(void *hObject);
+]]
+
+
+-- Used by the Download button to open the download page in the
+-- user's default browser. Also kept in AFK_UPDATE for the local
+-- limit.
+AFK_UPDATE.shell32 = ffi.load("shell32")
+
+ffi.cdef[[
+void *ShellExecuteA(
+    void *hwnd,
+    const char *lpOperation,
+    const char *lpFile,
+    const char *lpParameters,
+    const char *lpDirectory,
+    int nShowCmd
+);
+]]
+
 
 -- True only while this script is issuing a view command itself.
 --
@@ -5531,6 +5693,454 @@ end
 
 
 -- ============================================================
+-- UPDATE CHECK
+-- ============================================================
+--
+-- The sim must never stall waiting on a network call, so
+-- nothing here blocks. curl is started detached and writes the
+-- answer to a file; the frame loop then watches for that file
+-- to appear. If the network is down or the site is gone, the
+-- only consequence is that the file never arrives and the
+-- check times out quietly.
+--
+-- curl is used rather than the bundled LuaSocket because the
+-- site is HTTPS and no TLS module ships with FlyWithLua.
+-- Windows has included curl since Windows 10 1803, and it is
+-- built with Schannel, so HTTPS works with no extra files.
+
+function afk_update_spawn(command)
+
+    local startup =
+        ffi.new("AFK_STARTUPINFOA")
+
+    ffi.fill(
+        startup,
+        ffi.sizeof("AFK_STARTUPINFOA")
+    )
+
+    startup.cb =
+        ffi.sizeof("AFK_STARTUPINFOA")
+
+    local process =
+        ffi.new("AFK_PROCESS_INFORMATION")
+
+    -- CreateProcess is allowed to write into the command line,
+    -- so it has to be a mutable buffer and not a Lua string.
+    local buffer =
+        ffi.new("char[?]", #command + 1)
+
+    ffi.copy(buffer, command)
+
+    -- 0x08000000 is CREATE_NO_WINDOW.
+    local kernel32 =
+        AFK_UPDATE.kernel32
+
+    local created =
+        kernel32.CreateProcessA(
+            nil,
+            buffer,
+            nil,
+            nil,
+            0,
+            0x08000000,
+            nil,
+            nil,
+            startup,
+            process
+        )
+
+    if created == 0 then
+        return false
+    end
+
+    -- Nothing here waits on curl, so both handles are closed
+    -- straight away. Holding them would leak one pair of
+    -- handles per check.
+    kernel32.CloseHandle(process.hProcess)
+    kernel32.CloseHandle(process.hThread)
+
+    return true
+
+end
+
+
+-- Compares dotted version strings a digit group at a time, so
+-- 1.10.0 correctly beats 1.9.0 where a plain string compare
+-- would not. Missing groups count as zero.
+function afk_version_is_newer(candidate, installed)
+
+    local function groups(value)
+
+        local list = {}
+
+        for number in tostring(value):gmatch("%d+") do
+            list[#list + 1] = tonumber(number)
+        end
+
+        return list
+
+    end
+
+    local a = groups(candidate)
+    local b = groups(installed)
+
+    local count = #a
+
+    if #b > count then
+        count = #b
+    end
+
+    for i = 1, count do
+
+        local x = a[i] or 0
+        local y = b[i] or 0
+
+        if x > y then
+            return true
+        end
+
+        if x < y then
+            return false
+        end
+
+    end
+
+    return false
+
+end
+
+
+-- Shows a version in the one-decimal style used for releases,
+-- so "1.1.0" from the site reads as "1.1". Display only: the
+-- comparison above still uses the full value.
+function afk_version_display(value)
+
+    local major, minor =
+        tostring(value):match("(%d+)%.?(%d*)")
+
+    if major == nil then
+        return tostring(value)
+    end
+
+    if minor == "" then
+        minor = "0"
+    end
+
+    return major .. "." .. minor
+
+end
+
+
+-- Returns true once the check has reached a conclusion, good
+-- or bad, and polling should stop.
+--
+-- A half-written file is retried on the next poll. That is
+-- safer here than it looks: the balanced-brace match below
+-- cannot complete on a truncated release entry, so a partial
+-- download simply finds nothing and waits.
+--
+-- A reply that has stopped growing but still holds no version
+-- is a different thing, and worth saying plainly. Vercel
+-- answers unknown paths with the site's own HTML and a 200
+-- rather than a 404, so a file that is not actually published
+-- arrives looking like a perfectly successful download.
+function afk_update_read_response()
+
+    local file =
+        io.open(AFK_UPDATE.file, "rb")
+
+    if not file then
+        return false
+    end
+
+    local content =
+        file:read("*a") or ""
+
+    file:close()
+
+
+    -- %b{} matches from a brace to the one that balances it,
+    -- which walks the array one release at a time. The entries
+    -- hold arrays of strings but no nested objects, so every
+    -- match is exactly one release.
+    local version
+    local summary
+    local download
+
+    local first_version
+    local first_summary
+    local first_download
+
+    for object in content:gmatch("%b{}") do
+
+        local object_version =
+            object:match('"version"%s*:%s*"([^"]*)"')
+
+        if object_version ~= nil then
+
+            -- A download page is preferred over the raw
+            -- release link, being the friendlier landing spot.
+            local object_download =
+                object:match('"downloadPage"%s*:%s*"([^"]*)"')
+                or object:match('"latestRelease"%s*:%s*"([^"]*)"')
+
+            if first_version == nil then
+
+                first_version = object_version
+
+                first_summary =
+                    object:match('"summary"%s*:%s*"([^"]*)"')
+
+                first_download = object_download
+
+            end
+
+            if object:match('"latest"%s*:%s*true') then
+
+                version = object_version
+
+                summary =
+                    object:match('"summary"%s*:%s*"([^"]*)"')
+
+                download = object_download
+
+                break
+
+            end
+
+        end
+
+    end
+
+    -- Nothing claimed to be the latest, which is the normal
+    -- case for the single-release endpoint, so take the first.
+    if version == nil then
+        version = first_version
+        summary = first_summary
+        download = first_download
+    end
+
+
+    if version == nil
+    or version == "" then
+
+        if #content > 0
+        and #content == AFK_UPDATE.last_size then
+
+            AFK_UPDATE.state = "failed"
+
+            AFK_UPDATE.message =
+                "No version information at that address."
+
+            logMsg(
+                "AFK CAMERA: UPDATE CHECK - "
+                .. "REPLY HELD NO VERSION ("
+                .. tostring(#content)
+                .. " BYTES FROM "
+                .. AFK_UPDATE.url
+                .. ")"
+            )
+
+            return true
+
+        end
+
+        AFK_UPDATE.last_size = #content
+
+        return false
+
+    end
+
+
+    AFK_UPDATE.latest =
+        afk_version_display(version)
+
+    AFK_UPDATE.download =
+        download or AFK_UPDATE.page
+
+    if afk_version_is_newer(version, AFK_CAMERA_VERSION) then
+
+        AFK_UPDATE.state = "available"
+
+        AFK_UPDATE.message =
+            "Update available: "
+            .. AFK_UPDATE.latest
+
+        if summary ~= nil
+        and summary ~= "" then
+
+            AFK_UPDATE.message =
+                AFK_UPDATE.message
+                .. " - "
+                .. summary
+
+        end
+
+    else
+
+        AFK_UPDATE.state = "current"
+
+        AFK_UPDATE.message =
+            "Up to date."
+
+    end
+
+    logMsg(
+        "AFK CAMERA: UPDATE CHECK | INSTALLED "
+        .. afk_version_display(AFK_CAMERA_VERSION)
+        .. " | LATEST "
+        .. AFK_UPDATE.latest
+        .. " | "
+        .. AFK_UPDATE.state:upper()
+    )
+
+    return true
+
+end
+
+
+function afk_update_start()
+
+    if AFK_UPDATE.state == "checking" then
+        return
+    end
+
+    -- A stale answer from a previous check would be read back
+    -- immediately and look like a fresh one.
+    os.remove(AFK_UPDATE.file)
+
+    local command =
+        "curl.exe -s -f -L --max-time 10 -o \""
+        .. AFK_UPDATE.file
+        .. "\" \""
+        .. AFK_UPDATE.url
+        .. "\""
+
+    if not afk_update_spawn(command) then
+
+        AFK_UPDATE.state = "failed"
+
+        AFK_UPDATE.message =
+            "Could not start curl.exe."
+
+        logMsg(
+            "AFK CAMERA: UPDATE CHECK FAILED - "
+            .. "COULD NOT START CURL"
+        )
+
+        return
+
+    end
+
+    AFK_UPDATE.state = "checking"
+    AFK_UPDATE.message = ""
+    AFK_UPDATE.latest = ""
+    AFK_UPDATE.download = ""
+    AFK_UPDATE.last_size = -1
+    AFK_UPDATE.started = os.clock()
+    AFK_UPDATE.next_poll = AFK_UPDATE.started + 0.5
+
+    logMsg(
+        "AFK CAMERA: CHECKING FOR UPDATES AT "
+        .. AFK_UPDATE.url
+    )
+
+end
+
+
+-- Opens the download page in the default browser.
+--
+-- The address comes from the network, and ShellExecute will
+-- happily run a program if handed a path to one, so only a
+-- plain https web address is ever passed through. Anything else
+-- falls back to the hard-coded site.
+function afk_update_open_download()
+
+    local url =
+        AFK_UPDATE.download
+
+    if type(url) ~= "string"
+    or not url:match("^https://[%w%-%._~:/%?#%[%]@!%$&'%(%)%*%+,;=%%]+$") then
+
+        url = AFK_UPDATE.page
+
+    end
+
+    -- 1 is SW_SHOWNORMAL.
+    local result =
+        AFK_UPDATE.shell32.ShellExecuteA(
+            nil,
+            "open",
+            url,
+            nil,
+            nil,
+            1
+        )
+
+    -- ShellExecute reports success as any value above 32.
+    local opened =
+        tonumber(ffi.cast("intptr_t", result)) > 32
+
+    if opened then
+
+        AFK_UPDATE.message =
+            "Download page opened in your browser."
+
+    else
+
+        AFK_UPDATE.message =
+            "Could not open the browser. Visit: "
+            .. url
+
+    end
+
+    logMsg(
+        "AFK CAMERA: DOWNLOAD PAGE "
+        .. (opened and "OPENED" or "FAILED TO OPEN")
+        .. " - "
+        .. url
+    )
+
+end
+
+
+-- Runs every frame and costs one comparison unless a check is
+-- actually in flight.
+function afk_update_poll()
+
+    if AFK_UPDATE.state ~= "checking" then
+        return
+    end
+
+    local now = os.clock()
+
+    if now < AFK_UPDATE.next_poll then
+        return
+    end
+
+    AFK_UPDATE.next_poll = now + 0.5
+
+    if afk_update_read_response() then
+        return
+    end
+
+    if now - AFK_UPDATE.started > AFK_UPDATE.timeout then
+
+        AFK_UPDATE.state = "failed"
+
+        AFK_UPDATE.message =
+            "Could not reach the update server."
+
+        logMsg(
+            "AFK CAMERA: UPDATE CHECK TIMED OUT"
+        )
+
+    end
+
+end
+
+
+-- ============================================================
 -- SETTINGS PANEL LAYOUT
 -- ============================================================
 --
@@ -5543,7 +6153,8 @@ end
 --   3  COCKPIT VIEW     head movement size and speed
 --   4  WAKE-UP INPUTS   what ends AFK
 --   5  DISPLAY          debug HUD
---   6  Save / Restore / Close
+--   6  UPDATES          installed version, check button
+--   7  Save / Restore / Close
 --
 -- Only imgui calls already proven to work in this FlyWithLua
 -- build are used here: TextUnformatted, Separator, Checkbox,
@@ -5917,7 +6528,65 @@ function afk_settings_on_build(wnd, x, y)
 
 
     -- --------------------------------------------------------
-    -- 6. SAVE / RESTORE / CLOSE
+    -- 6. UPDATES
+    -- --------------------------------------------------------
+
+    afk_settings_group("UPDATES")
+
+    imgui.TextUnformatted(
+        "Installed version: "
+        .. afk_version_display(AFK_CAMERA_VERSION)
+    )
+
+    if AFK_UPDATE.state == "checking" then
+
+        imgui.TextUnformatted(
+            "Checking ..."
+        )
+
+    else
+
+        if imgui.Button(
+            "Check for updates",
+            190,
+            28
+        ) then
+
+            afk_update_start()
+
+        end
+
+    end
+
+    if AFK_UPDATE.message ~= "" then
+
+        imgui.TextUnformatted(
+            AFK_UPDATE.message
+        )
+
+    end
+
+    if AFK_UPDATE.state == "available" then
+
+        if imgui.Button(
+            "Download " .. AFK_UPDATE.latest,
+            190,
+            28
+        ) then
+
+            afk_update_open_download()
+
+        end
+
+        imgui.TextUnformatted(
+            AFK_UPDATE.download
+        )
+
+    end
+
+
+    -- --------------------------------------------------------
+    -- 7. SAVE / RESTORE / CLOSE
     -- --------------------------------------------------------
 
     imgui.TextUnformatted("")
@@ -6472,31 +7141,42 @@ afk_view_command_callback = ffi.cast(
 )
 
 
-for i = 1, #AFK_VIEW_COMMANDS do
+-- Inside a function on purpose. A loop at the top level puts
+-- its counter and body locals on the main chunk, which is
+-- already at Lua's 200 local limit; one more and the script
+-- fails to compile and FlyWithLua quarantines it.
+function afk_hook_view_commands()
 
-    local command_ref =
-        XPLM.XPLMFindCommand(
-            AFK_VIEW_COMMANDS[i]
-        )
+    for i = 1, #AFK_VIEW_COMMANDS do
 
-    -- Not every command exists in every X-Plane build, and
-    -- XPLMFindCommand simply returns null for the ones that do
-    -- not. Those are skipped rather than treated as an error.
-    if command_ref ~= nil then
+        local command_ref =
+            XPLM.XPLMFindCommand(
+                AFK_VIEW_COMMANDS[i]
+            )
 
-        XPLM.XPLMRegisterCommandHandler(
-            command_ref,
-            afk_view_command_callback,
-            1,
-            nil
-        )
+        -- Not every command exists in every X-Plane build, and
+        -- XPLMFindCommand simply returns null for the ones that
+        -- do not. Those are skipped rather than treated as an
+        -- error.
+        if command_ref ~= nil then
 
-        afk_view_command_refs[#afk_view_command_refs + 1] =
-            command_ref
+            XPLM.XPLMRegisterCommandHandler(
+                command_ref,
+                afk_view_command_callback,
+                1,
+                nil
+            )
+
+            afk_view_command_refs[#afk_view_command_refs + 1] =
+                command_ref
+
+        end
 
     end
 
 end
+
+afk_hook_view_commands()
 
 logMsg(
     "AFK CAMERA: VIEW COMMANDS HOOKED: "
@@ -6511,6 +7191,13 @@ logMsg(
 -- ============================================================
 
 function afk_director_update()
+
+    -- Watch for an update check finishing. Deliberately ahead
+    -- of the enabled test below, so a check started from the
+    -- settings window still completes while the camera itself
+    -- is switched off.
+    afk_update_poll()
+
 
     -- Complete plugin disable: release AFK camera ownership,
     -- clear AFK state and do not accumulate idle time.
@@ -7246,6 +7933,11 @@ logMsg(
 
 logMsg(
     "AFK CAMERA PHASE 5"
+)
+
+logMsg(
+    "AFK Camera version: "
+    .. afk_version_display(AFK_CAMERA_VERSION)
 )
 
 logMsg(
