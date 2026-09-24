@@ -18,7 +18,7 @@
 -- number, so "1.10" would count as newer than "1.9", not as
 -- the same as "1.1".
 
-local AFK_CAMERA_VERSION = "1.2"
+local AFK_CAMERA_VERSION = "1.3"
 
 
 -- ============================================================
@@ -2639,7 +2639,8 @@ initialise_better_mouse_yoke_values()
 -- player activity. The assignment is only used to label the
 -- activity in the HUD.
 --
--- Buttons are treated as activity while physically held.
+-- Buttons are treated as activity when they change, not merely
+-- because they read as pressed. See JOYSTICK_BUTTONS below.
 
 local joystick_axis_values =
     dataref_table(
@@ -2660,8 +2661,42 @@ local joystick_button_values =
 local JOYSTICK_AXIS_COUNT =
     500
 
-local JOYSTICK_BUTTON_COUNT =
-    3200
+-- ------------------------------------------------------------
+-- LATCHING SWITCHES
+-- ------------------------------------------------------------
+--
+-- Plenty of hardware reports a switch position as a button that
+-- stays pressed for as long as the switch is in that position:
+-- the Honeycomb Alpha magneto key and master switches, Bravo
+-- toggles, WinCtrl mode and detent switches, and so on. Read
+-- naively, those look like a button held down forever, and AFK
+-- can never start.
+--
+-- So a button is activity when it CHANGES, press or release,
+-- and while held only for the first hold_limit seconds. That
+-- still covers a trim or brake button held down on purpose.
+-- Past the limit the button is taken to be a latched switch and
+-- ignored until it changes again. Buttons already on when the
+-- script loads are treated as latched from the start.
+--
+-- Kept in one table to cost a single local; the main chunk is
+-- at the 200 local limit.
+local JOYSTICK_BUTTONS = {
+
+    count = 3200,
+
+    -- Seconds a held button keeps counting as activity.
+    hold_limit = 30.0,
+
+    -- previous[i] is true while button i is down. Only down
+    -- buttons are stored, so the table stays tiny.
+    previous = {},
+
+    -- down_since[i] is when button i went down, or nil once it
+    -- has been written off as a latched switch.
+    down_since = {}
+
+}
 
 -- The change threshold is the user's dead zone setting
 -- (afk_joystick_deadzone, percent) converted to a 0..1 fraction
@@ -2737,8 +2772,118 @@ function initialise_joystick_values()
 
     end
 
+    -- Anything already on at load is a switch position, not
+    -- someone pressing a button, so it starts out latched.
+    JOYSTICK_BUTTONS.previous = {}
+    JOYSTICK_BUTTONS.down_since = {}
+
+    for i = 0, JOYSTICK_BUTTONS.count - 1 do
+
+        local pressed =
+            tonumber(
+                joystick_button_values[i]
+            )
+
+        if pressed ~= nil
+        and pressed ~= 0 then
+
+            JOYSTICK_BUTTONS.previous[i] =
+                true
+
+        end
+
+    end
+
     joystick_initialised =
         true
+
+end
+
+
+-- Returns true if any button counts as activity this frame.
+-- Every button is visited every frame, even after one is found,
+-- so the stored states never go stale.
+function poll_joystick_buttons()
+
+    local buttons =
+        JOYSTICK_BUTTONS
+
+    local now =
+        os.clock()
+
+    local detected =
+        false
+
+    for i = 0, buttons.count - 1 do
+
+        local value =
+            tonumber(
+                joystick_button_values[i]
+            )
+
+        local pressed =
+            value ~= nil
+            and value ~= 0
+
+        local was_pressed =
+            buttons.previous[i] == true
+
+        if pressed ~= was_pressed then
+
+            -- Pressed or released: a real, deliberate change,
+            -- including a latched switch being flipped.
+            if pressed then
+
+                buttons.previous[i] = true
+                buttons.down_since[i] = now
+
+            else
+
+                buttons.previous[i] = nil
+                buttons.down_since[i] = nil
+
+            end
+
+            detected =
+                true
+
+        elseif pressed then
+
+            local since =
+                buttons.down_since[i]
+
+            if since ~= nil then
+
+                if now - since <= buttons.hold_limit then
+
+                    detected =
+                        true
+
+                else
+
+                    buttons.down_since[i] =
+                        nil
+
+                    logMsg(
+                        "AFK CAMERA: JOYSTICK BUTTON "
+                        .. tostring(i)
+                        .. " HELD OVER "
+                        .. string.format(
+                            "%.0f",
+                            buttons.hold_limit
+                        )
+                        .. " S - TREATED AS A LATCHED SWITCH"
+                    )
+
+                end
+
+            end
+
+        end
+
+    end
+
+    return detected
 
 end
 
@@ -2834,42 +2979,29 @@ function poll_joystick_input()
     joystick_last_max_difference =
         frame_max_difference
 
+    -- --------------------------------------------------------
+    -- Joystick buttons
+    -- --------------------------------------------------------
+    --
+    -- Polled even when an axis already moved, so button states
+    -- stay current. A latched switch is ignored; see
+    -- JOYSTICK_BUTTONS.
+
+    local button_detected =
+        poll_joystick_buttons()
+
     if axis_detected then
 
         joystick_input_detected =
             true
 
-        return
+    elseif button_detected then
 
-    end
+        joystick_input_detected =
+            true
 
-
-    -- --------------------------------------------------------
-    -- Joystick buttons
-    -- --------------------------------------------------------
-    --
-    -- Physical joystick buttons are active while held.
-    -- No button is generated merely because an assignment exists.
-
-    for i = 0, JOYSTICK_BUTTON_COUNT - 1 do
-
-        local pressed =
-            tonumber(
-                joystick_button_values[i]
-            )
-
-        if pressed ~= nil
-        and pressed ~= 0 then
-
-            joystick_input_detected =
-                true
-
-            joystick_input_type =
-                "Joystick Button"
-
-            return
-
-        end
+        joystick_input_type =
+            "Joystick Button"
 
     end
 
